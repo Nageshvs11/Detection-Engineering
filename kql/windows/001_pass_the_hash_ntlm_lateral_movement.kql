@@ -1,0 +1,307 @@
+// ============================================================
+// Use case ID:  OS-DET-WIN-001_pass_the_hash_ntlm_lateral_movement
+// Rule:         001_pass_the_hash_ntlm_lateral_movement.kql
+// ATT&CK:       T1550.002 — Use Alternate Authentication Material: Pass the Hash
+// Severity:     high / critical (see severity graduation below)
+// Author:       Detection KB
+// Date:         2026-05-27
+//
+// Target:       Both (Sentinel and Defender XDR Advanced Hunting)
+//   Sentinel    → TimeGenerated; requires Defender XDR connector for DeviceLogonEvents
+//   DefenderXDR → swap TimeGenerated → Timestamp in the two base filters
+//
+// Schedule:     every 5m
+// Lookback:     1h
+// Suppress:     AccountName:2h  (one alert per account per 2 hours)
+//
+// Prerequisite: Microsoft Defender for Endpoint sensor must be deployed on
+//               endpoints. DeviceLogonEvents must be present in the workspace.
+//
+// Description:
+//   Detects pass-the-hash (PtH) by monitoring two observable moments in the
+//   attack chain:
+//
+//   SOURCE (attacker host) — LogonType 9 "NewCredentials":
+//     Tools like Mimikatz (sekurlsa::pth), Invoke-TheHash, and CrackMapExec
+//     inject a stolen NTLM hash by creating a new local logon session using
+//     LogonType 9 (LOGON32_LOGON_NEW_CREDENTIALS / runas /netonly). The new
+//     session carries the stolen hash; outbound NTLM requests from that session
+//     use the hash instead of the plaintext password.
+//     Observable: DeviceLogonEvents on the ATTACKER device shows LogonType
+//     "NewCredentials" + Protocol NTLM + an unusual initiating process.
+//
+//   DESTINATION (target host) — LogonType 3 "Network" spread:
+//     When the attacker's injected session accesses remote resources, the target
+//     device records a Network logon (Type 3) via NTLM. A single NTLM Network
+//     logon is common; one source IP authenticating to 3+ distinct devices via
+//     NTLM in a short window is laterally moving.
+//     Observable: DeviceLogonEvents summarised by source IP → count of distinct
+//     target devices.
+//
+// False positives:
+//   - Local account authentication to remote shares: local accounts cannot use
+//     Kerberos, so all local-account network auth is NTLM — exclude accounts
+//     where AccountDomain matches the source DeviceName (local account login)
+//   - Legacy applications without Kerberos support (old NAS, printers, scanners):
+//     produces constant NTLM Type 3 logons — tune by excluding known device IPs
+//     or initiating process names (e.g. backup agent executables)
+//   - Management / RMM tools (ConnectWise, ManageEngine, SCCM) that use
+//     NTLM for WMI / file-share operations — exclude by known tool process names
+//     or source IP ranges if those tools operate from a dedicated management VLAN
+//   - mstsc.exe (RDP): falls back to NTLM when NLA/Kerberos is unavailable —
+//     exclude RemotePort 3389 or add mstsc.exe to the process allow-list
+//   - NewCredentials (Type 9) from "runas /netonly" for legitimate admin tasks —
+//     correlate with interactive sessions and change tickets; low volume expected
+// ============================================================
+
+// ── Shared constants ──────────────────────────────────────────────────────────
+let LookbackWindow  = 1h;
+let SpreadThreshold = 3;    // distinct targets from one source in window = lateral movement
+
+// Processes that legitimately initiate NTLM authentication and should not fire
+// as NewCredentials alerts on their own. Keep this list intentionally short.
+let AllowedNTLMProcesses = dynamic([
+    "lsass.exe",          // credential subsystem — normal
+    "svchost.exe",        // service host NTLM pass-through
+    "services.exe",       // SCM
+    "wininit.exe",
+    "winlogon.exe",
+    "csrss.exe",
+    "smss.exe",
+    "system",
+    "mstsc.exe",          // RDP client NLA fallback
+    "msrdcw.exe",         // Windows App RDP client
+    "outlook.exe",        // MAPI/Exchange
+    "onedrive.exe",       // OneDrive sync
+    "teams.exe",
+    "iexplore.exe",       // IE NTLM SSO
+    "msedge.exe",         // Edge integrated auth
+    "chrome.exe"          // Chrome integrated auth
+]);
+
+// Known management / RMM tool executables that use NTLM for WMI/SMB
+// Add your environment's agents here to suppress noise.
+let ManagementProcesses = dynamic([
+    // "nable.exe",        // N-able RMM
+    // "connectwisecontrol.client.exe",
+    // "teamviewer.exe",
+    // "ccmexec.exe"       // SCCM client
+]);
+
+// ── Branch A: Overpass-the-Hash — suspicious NewCredentials NTLM on source ───
+// This fires on the ATTACKER device when a tool injects a stolen hash into a
+// new logon session (LogonType 9). Legitimate NewCredentials NTLM is rare and
+// almost always originates from system processes or known admin patterns.
+let OverpassTheHash = DeviceLogonEvents
+| where TimeGenerated > ago(LookbackWindow)
+| where ActionType == "LogonSuccess"
+| where LogonType == "NewCredentials"                      // Type 9 — hash injection
+| where Protocol == "NTLM"
+// --- noise reduction ---
+| where AccountDomain !in~ ("NT AUTHORITY", "WINDOW MANAGER", "Font Driver Host")
+| where not(AccountName endswith "$")                      // exclude machine accounts
+| where InitiatingProcessFileName !in~ (AllowedNTLMProcesses)
+| where InitiatingProcessFileName !in~ (ManagementProcesses)
+| where RemoteIPType != "Loopback"
+| extend
+    DetectionBranch  = "OverpassTheHash_Type9",
+    // Severity: any unexpected NewCredentials NTLM from a non-system process is
+    // high-confidence; Mimikatz/Invoke-TheHash are the primary sources of this event
+    Severity         = "High",
+    BranchDetail     = strcat(
+        "NTLM NewCredentials session created by process: ",
+        InitiatingProcessFileName, " (", InitiatingProcessCommandLine, ")"
+    )
+| project
+    TimeGenerated,
+    DeviceName,
+    DeviceId,
+    AccountName,
+    AccountDomain,
+    AccountSid,
+    AccountObjectId,
+    LogonType,
+    Protocol,
+    RemoteIP,
+    RemoteIPType,
+    RemoteDeviceName,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    InitiatingProcessParentFileName,
+    IsLocalAdmin,
+    ReportId,
+    DetectionBranch,
+    Severity,
+    BranchDetail;
+
+// ── Branch B: NTLM lateral movement spread — one source → many targets ────────
+// This fires on DESTINATION devices. A single NTLM Network logon is common;
+// one source IP authenticating to 3+ distinct devices in one hour is the lateral
+// movement indicator. Attacker pivots workstation-to-workstation using stolen hashes.
+let NTLMNetworkBase = DeviceLogonEvents
+| where TimeGenerated > ago(LookbackWindow)
+| where ActionType == "LogonSuccess"
+| where LogonType == "Network"                             // Type 3 — network auth
+| where Protocol == "NTLM"
+| where AccountDomain !in~ ("NT AUTHORITY", "WINDOW MANAGER", "Font Driver Host")
+| where not(AccountName endswith "$")                      // machine account auth is normal
+| where RemoteIPType != "Loopback"
+| where isnotempty(RemoteIP);
+
+// Identify accounts+sources hitting multiple targets
+let SpreadSummary = NTLMNetworkBase
+| summarize
+    TargetCount        = dcount(DeviceName),
+    Targets            = make_set(DeviceName, 20),
+    FirstSeen          = min(TimeGenerated),
+    LastSeen           = max(TimeGenerated),
+    EventCount         = count()
+    by RemoteIP, AccountName, AccountDomain
+| where TargetCount >= SpreadThreshold;
+
+// Re-join to get full event detail for the most suspicious (highest target count) hit
+let LateralMovement = NTLMNetworkBase
+| join kind=inner (
+    SpreadSummary
+    | project RemoteIP, AccountName, AccountDomain,
+              TargetCount, Targets, FirstSeen, LastSeen
+) on RemoteIP, AccountName, AccountDomain
+// Keep only the first logon per account+source for the alert row
+| summarize arg_min(TimeGenerated, *) by RemoteIP, AccountName, AccountDomain
+| extend
+    DetectionBranch  = "NTLMLateralMovement_Spread",
+    Severity         = case(
+        // Critical: confirmed lateral spread — 5+ targets leaves no doubt
+        TargetCount >= 5, "Critical",
+        // High: 3-4 targets — strong lateral movement indicator
+        "High"
+    ),
+    BranchDetail     = strcat(
+        "NTLM Network logons to ", TargetCount, " distinct targets: ",
+        tostring(Targets)
+    )
+| project
+    TimeGenerated,
+    DeviceName,
+    DeviceId,
+    AccountName,
+    AccountDomain,
+    AccountSid,
+    AccountObjectId,
+    LogonType,
+    Protocol,
+    RemoteIP,
+    RemoteIPType,
+    RemoteDeviceName,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    InitiatingProcessParentFileName,
+    IsLocalAdmin,
+    ReportId,
+    DetectionBranch,
+    Severity,
+    BranchDetail,
+    TargetCount     = TargetCount,
+    Targets         = Targets;
+
+// ── Union both branches and emit final alert rows ────────────────────────────
+OverpassTheHash
+| union LateralMovement
+// ── Rule metadata ─────────────────────────────────────────────────────────────
+| extend
+    ATT_CK  = "T1550.002",
+    RuleID  = "OS-DET-WIN-001_pass_the_hash_ntlm_lateral_movement",
+    Triage  = strcat(
+        "1. Confirm account '", AccountName, "@", AccountDomain, "' is not a service/local account. ",
+        "2. Check RemoteIP (", RemoteIP, ") — is it a workstation or a server/DC? ",
+        "3. Review DeviceLogonEvents for this account in the past 24h for scope. ",
+        "4. Pull DeviceProcessEvents from RemoteDeviceName/RemoteIP for PtH tool artifacts ",
+        "(mimikatz.exe, mimilib.dll, Invoke-TheHash, crackmapexec, impacket). ",
+        "5. Check DeviceNetworkEvents for SMB (445) / WMI (135,49152-65535) connections. ",
+        "6. Reset the account's NTLM hash (password change) and audit all devices it touched."
+    )
+// ── Entity fields ─────────────────────────────────────────────────────────────
+// Sentinel entity mapping:
+//   Account → AccountName + AccountDomain
+//   Host    → DeviceName (destination), RemoteDeviceName (source if known)
+//   IP      → RemoteIP
+// Defender XDR custom detection required columns: ReportId + DeviceName (destination)
+| extend
+    AccountNameOut   = AccountName,
+    AccountDomainOut = AccountDomain
+// ── Output ────────────────────────────────────────────────────────────────────
+| project-reorder
+    Severity,
+    DetectionBranch,
+    AccountNameOut,
+    AccountDomainOut,
+    AccountSid,
+    AccountObjectId,
+    IsLocalAdmin,
+    DeviceName,
+    RemoteIP,
+    RemoteDeviceName,
+    LogonType,
+    Protocol,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    InitiatingProcessParentFileName,
+    TimeGenerated,
+    BranchDetail,
+    TargetCount,
+    Targets,
+    ReportId,
+    ATT_CK,
+    RuleID,
+    Triage
+| sort by Severity asc, TimeGenerated asc   // Critical rows surface first
+
+// ============================================================
+// TEST CASES
+//
+// Branch A — Positive (should fire, High):
+//   Device:                WORKSTATION07
+//   ActionType:            LogonSuccess
+//   LogonType:             NewCredentials
+//   Protocol:              NTLM
+//   AccountName:           jsmith
+//   AccountDomain:         contoso.com
+//   InitiatingProcessFileName: powershell.exe
+//   InitiatingProcessCommandLine: Invoke-TheHash -Target 10.1.1.20 ...
+//   RemoteIPType:          Private
+//   Expected:              DetectionBranch=OverpassTheHash_Type9, Severity=High
+//
+// Branch A — Negative (should NOT fire — allowed process):
+//   LogonType:             NewCredentials
+//   Protocol:              NTLM
+//   InitiatingProcessFileName: lsass.exe
+//   Expected:              filtered by AllowedNTLMProcesses
+//
+// Branch B — Positive (should fire, Critical):
+//   Source RemoteIP:       10.1.1.50  (attacker workstation)
+//   AccountName:           jsmith
+//   AccountDomain:         contoso.com
+//   Destinations:          SRV01, SRV02, SRV03, SRV04, SRV05 (5 targets)
+//   LogonType:             Network
+//   Protocol:              NTLM
+//   ActionType:            LogonSuccess
+//   Expected:              DetectionBranch=NTLMLateralMovement_Spread, Severity=Critical
+//
+// Branch B — Positive (should fire, High):
+//   Source RemoteIP:       10.1.1.50
+//   Destinations:          SRV01, SRV02, SRV03  (3 targets)
+//   Expected:              DetectionBranch=NTLMLateralMovement_Spread, Severity=High
+//
+// Branch B — Negative (should NOT fire — below spread threshold):
+//   Source RemoteIP:       10.1.1.50
+//   Destinations:          SRV01, SRV02  (2 targets — below SpreadThreshold=3)
+//   Expected:              filtered by SpreadThreshold
+//
+// Branch B — Negative (should NOT fire — machine account):
+//   AccountName:           WORKSTATION07$   (ends with "$")
+//   Expected:              filtered by machine account exclusion
+//
+// Branch B — Negative (should NOT fire — loopback):
+//   RemoteIPType:          Loopback
+//   Expected:              filtered by RemoteIPType check
+// ============================================================

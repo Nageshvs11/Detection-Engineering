@@ -1,0 +1,236 @@
+// ============================================================
+// Rule:         Handala Threat Actor — Wiper and Service Disruption Chain
+// Platform:     Microsoft Sentinel / Microsoft Defender for Endpoint
+// Data source:  DeviceProcessEvents (MDE)
+//               Substitute SecurityEvent (EID 4688) where MDE is unavailable —
+//               replace FileName→NewProcessName, ProcessCommandLine→CommandLine
+// ============================================================
+//
+// Threat Actor: Handala (pro-Palestinian hacktivist group)
+//               Targeting UAE government and critical infrastructure
+//               to destroy data and disrupt services
+//
+// ATT&CK:
+//   T1485   — Data Destruction
+//   T1490   — Inhibit System Recovery (VSS deletion, bcdedit, wbadmin)
+//   T1561.001 — Disk Wipe: Disk Content Wipe
+//   T1561.002 — Disk Wipe: Disk Structure Wipe
+//   T1489   — Service Stop (AV, backup, EventLog)
+//   T1562.001 — Impair Defenses: Disable or Modify Tools
+//   T1070.001 — Indicator Removal: Clear Windows Event Logs
+//
+// Hypothesis:
+//   Handala executes a fast sequential wiper chain — impair defenses,
+//   delete shadow copies, destroy data, clear logs — typically completing
+//   within 30 minutes. Requiring 2+ distinct TTPs from the same host
+//   in that window separates attacker activity from isolated sysadmin ops.
+//
+// Severity logic:
+//   Critical  — 4+ distinct TTPs (full wiper chain confirmed)
+//   High      — 3 distinct TTPs
+//   Medium    — 2 distinct TTPs (wiper chain started, not yet complete)
+//
+// False positives:
+//   - IT admins running vssadmin/wbadmin during scheduled backup maintenance
+//     (single TTP, isolated — below the 2-TTP threshold)
+//   - Disk imaging workflows using diskpart during OS deployment
+//     (no shadow-delete or bcdedit pairing expected)
+//   - Authorized security testing — correlate with change tickets and
+//     source account before suppressing
+// ============================================================
+
+let WiperWindow = 30m;   // Handala wiper chains complete in under 30 minutes
+
+// ── T1490: Inhibit System Recovery ──────────────────────────────────────────
+// Deletes VSS snapshots and disables Windows Recovery to prevent data restoration
+let T1490_RecoveryImpair = DeviceProcessEvents
+| where Timestamp > ago(WiperWindow)
+| where
+    // Shadow copy deletion — primary Handala recovery inhibition method
+    (FileName in~ ("vssadmin.exe", "wmic.exe")
+        and ProcessCommandLine has_any (
+            "delete shadows",
+            "shadowcopy delete",
+            "shadowcopy where"
+        )
+    )
+    or
+    // bcdedit: disable recovery, ignore boot failures, force safeboot
+    (FileName =~ "bcdedit.exe"
+        and ProcessCommandLine has_any (
+            "recoveryenabled no",
+            "bootstatuspolicy ignoreallfailures",
+            "safeboot network",
+            "safeboot minimal"
+        )
+    )
+    or
+    // wbadmin: destroy backup catalog and system-state backups
+    (FileName =~ "wbadmin.exe"
+        and ProcessCommandLine has_any (
+            "delete catalog",
+            "delete systemstatebackup"
+        )
+    )
+    or
+    // reagentc: disable Windows Recovery Environment (WinRE)
+    (FileName =~ "reagentc.exe" and ProcessCommandLine has "/disable")
+| extend TTP = "T1490"
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine, TTP;
+
+// ── T1561.001 / T1485: Disk Content Wipe and Data Destruction ────────────────
+// Overwrites or bulk-deletes files; combined with T1490 = full wiper pattern
+let T1561_DiskWipe = DeviceProcessEvents
+| where Timestamp > ago(WiperWindow)
+| where
+    // cipher /w overwrites free space — used after mass deletion to prevent recovery
+    (FileName =~ "cipher.exe" and ProcessCommandLine has "/w:")
+    or
+    // sdelete: Sysinternals secure delete, used in multiple Handala campaigns
+    (FileName in~ ("sdelete.exe", "sdelete64.exe"))
+    or
+    // diskpart with destructive sub-commands (clean wipes partition table)
+    (FileName =~ "diskpart.exe"
+        and ProcessCommandLine has_any ("clean", "delete volume", "delete partition")
+    )
+    or
+    // format with quick-format on a lettered drive (destroys filesystem)
+    (FileName =~ "format.exe"
+        and ProcessCommandLine has_any ("c:", "d:", "e:", "f:", "g:")
+        and ProcessCommandLine has_any ("/q", "/Q", "/fs:ntfs", "/fs:fat32")
+    )
+    or
+    // PowerShell recursive force-delete — wiper script pattern
+    (FileName in~ ("powershell.exe", "pwsh.exe")
+        and ProcessCommandLine has_any ("Remove-Item", "[System.IO.File]::WriteAllBytes")
+        and ProcessCommandLine has_any ("-Recurse", "-Force")
+        and ProcessCommandLine has_any ("C:\\", "D:\\", "E:\\")
+    )
+    or
+    // cmd rd /s /q — recursive directory wipe from command shell
+    (FileName =~ "cmd.exe"
+        and ProcessCommandLine has_any (
+            "rd /s /q c:\\",
+            "rd /s /q d:\\",
+            "rmdir /s /q c:\\",
+            "rmdir /s /q d:\\"
+        )
+    )
+| extend TTP = "T1561.001/T1485"
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine, TTP;
+
+// ── T1562.001 / T1489: Impair Defenses and Stop Critical Services ────────────
+// Handala disables AV and stops backup/logging services before or during wiping
+let T1562_DefenseImpair = DeviceProcessEvents
+| where Timestamp > ago(WiperWindow)
+| where
+    // Stop Windows security and AV services via sc or net
+    (FileName in~ ("sc.exe", "net.exe", "net1.exe")
+        and ProcessCommandLine has_any ("stop", "disable", "delete")
+        and ProcessCommandLine has_any (
+            "WinDefend",        // Windows Defender
+            "MpsSvc",           // Windows Firewall
+            "wscsvc",           // Security Center
+            "SecurityHealthService",
+            "MsSense",          // Defender for Endpoint sensor
+            "Sense",
+            "vss",              // Volume Shadow Copy
+            "swprv"             // Shadow copy provider
+        )
+    )
+    or
+    // Stop backup, database, and event logging services
+    (FileName in~ ("net.exe", "net1.exe")
+        and ProcessCommandLine has "stop"
+        and ProcessCommandLine has_any (
+            "eventlog",
+            "mssqlserver",
+            "MSSQL$",
+            "wuauserv",
+            "BITS",
+            "MSExchangeIS",
+            "BackupExecAgentAccelerator"
+        )
+    )
+    or
+    // Disable Defender realtime protection via PowerShell
+    (FileName in~ ("powershell.exe", "pwsh.exe")
+        and ProcessCommandLine has_any (
+            "Set-MpPreference",
+            "DisableRealtimeMonitoring $true",
+            "DisableBehaviorMonitoring $true",
+            "DisableIOAVProtection $true",
+            "DisableIntrusionPreventionSystem $true"
+        )
+    )
+    or
+    // sc config to permanently disable services at next start
+    (FileName =~ "sc.exe"
+        and ProcessCommandLine has "config"
+        and ProcessCommandLine has "start= disabled"
+    )
+| extend TTP = "T1562.001/T1489"
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine, TTP;
+
+// ── T1070.001: Clear Windows Event Logs ──────────────────────────────────────
+// Handala clears Security, System, and PowerShell logs to destroy forensic evidence
+let T1070_LogClear = DeviceProcessEvents
+| where Timestamp > ago(WiperWindow)
+| where
+    // wevtutil cl — clears individual log channels
+    (FileName =~ "wevtutil.exe"
+        and ProcessCommandLine has_any ("cl ", "clear-log", "/e:false")
+    )
+    or
+    // PowerShell-based event log clearing
+    (FileName in~ ("powershell.exe", "pwsh.exe")
+        and ProcessCommandLine has_any (
+            "Clear-EventLog",
+            "Remove-EventLog",
+            "[System.Diagnostics.EventLog]::Delete"
+        )
+    )
+    or
+    // Disabling log channels entirely (not just clearing)
+    (FileName =~ "wevtutil.exe"
+        and ProcessCommandLine has "set-log"
+        and ProcessCommandLine has "/e:false"
+    )
+| extend TTP = "T1070.001"
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine, TTP;
+
+// ── Correlation: Wiper Chain ──────────────────────────────────────────────────
+// Union all TTP sub-queries, then require 2+ distinct techniques from the same
+// host within WiperWindow. Single-TTP hits are sysadmin noise; chains are Handala.
+T1490_RecoveryImpair
+| union T1561_DiskWipe
+| union T1562_DefenseImpair
+| union T1070_LogClear
+| summarize
+    TTPCount      = dcount(TTP),
+    TTPs          = make_set(TTP),
+    Commands      = make_set(ProcessCommandLine),
+    Accounts      = make_set(AccountName),
+    FirstObserved = min(Timestamp),
+    LastObserved  = max(Timestamp),
+    EventCount    = count()
+    by DeviceName
+| where TTPCount >= 2
+| extend
+    ChainDuration_min = datetime_diff("minute", LastObserved, FirstObserved)
+| where ChainDuration_min <= 30     // Wiper chain must complete within 30 minutes
+| extend
+    Severity = case(
+        TTPCount >= 4, "Critical",  // Full chain: impair + wipe + disable + clear logs
+        TTPCount >= 3, "High",      // Three-stage chain confirmed
+        "Medium"                     // Two-stage chain — hunt for remaining stages
+    ),
+    ThreatActor = "Handala",
+    ATT_CK      = "T1485,T1490,T1561.001,T1561.002,T1489,T1562.001,T1070.001",
+    Triage      = "Isolate host immediately. Preserve memory and disk image before remediation. "
+                  "Check for lateral movement from this host within the same window. "
+                  "Pivot to Accounts field for credential compromise scope."
+| project-reorder
+    Severity, DeviceName, ThreatActor, TTPCount, TTPs,
+    ChainDuration_min, FirstObserved, LastObserved,
+    Accounts, EventCount, Commands, ATT_CK, Triage

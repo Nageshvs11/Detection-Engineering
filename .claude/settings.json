@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "detection-kb": {
+      "command": "python3",
+      "args": ["/root/mcp-detection-kb/server.py"]
+    }
+  }
+}

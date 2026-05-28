@@ -1,0 +1,38 @@
+title: Pass-the-Hash - Suspicious NTLM Lateral Movement
+id: e4a6ab2c-9f1d-4b7c-8e3a-1f5c9d0b2e4f
+status: test
+description: Detects Pass-the-Hash lateral movement by identifying NTLM network logons
+    (type 3) where the workstation name is blank or mismatched, and authentication
+    originates from an unusual source, a pattern common in PtH tools such as Mimikatz,
+    Impacket psexec, and CrackMapExec.
+references:
+    - https://attack.mitre.org/techniques/T1550/002/
+    - https://www.microsoft.com/security/blog/2021/08/18/how-to-detect-pass-the-hash-attacks/
+author: Detection KB
+date: 2024-02-01
+modified: 2024-06-01
+tags:
+    - attack.lateral_movement
+    - attack.t1550.002
+    - attack.defense_evasion
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4624
+        LogonType: 3
+        AuthenticationPackageName: 'NTLM'
+        SubjectUserSid: 'S-1-0-0'
+    filter_local_accounts:
+        TargetUserName|endswith: '$'
+    filter_anonymous:
+        TargetUserName: 'ANONYMOUS LOGON'
+    filter_blank_workstation:
+        WorkstationName: '-'
+        KeyLength: '0'
+    condition: selection and not filter_local_accounts and not filter_anonymous and filter_blank_workstation
+falsepositives:
+    - Network file share access from some legacy systems
+    - Scheduled tasks using NTLM authentication
+level: medium

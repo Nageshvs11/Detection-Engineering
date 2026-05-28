@@ -1,0 +1,87 @@
+title: PowerShell SPN Enumeration for Kerberoasting
+id: c3e8d4f1-7b2a-4e9c-8d5f-1a6b3c9e2d47
+status: experimental
+description: >
+    Detects PowerShell script blocks performing SPN enumeration patterns used
+    as the reconnaissance phase of Kerberoasting (T1558.003). Covers PowerView's
+    Invoke-Kerberoast / Get-DomainSPNTicket, AD module queries filtering on
+    ServicePrincipalName, and raw [adsisearcher] LDAP queries for SPN-bearing
+    accounts. This complements ticket-request rules (EventID 4769) by catching
+    the enumeration before any Kerberos traffic is generated.
+references:
+    - https://attack.mitre.org/techniques/T1558/003/
+    - https://github.com/PowerShellMafia/PowerSploit/blob/master/Recon/PowerView.ps1
+    - https://github.com/redcanaryco/atomic-red-team/blob/master/atomics/T1558.003/T1558.003.md
+    - https://www.semperis.com/blog/kerberoasting-detection/
+author: Detection KB
+date: 2026-05-27
+tags:
+    - attack.credential-access
+    - attack.t1558.003
+logsource:
+    category: ps_script
+    product: windows
+    definition: 'Requirements: PowerShell Script Block Logging must be enabled
+        (HKLM\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging\EnableScriptBlockLogging = 1)'
+detection:
+    selection_powerview:
+        ScriptBlockText|contains:
+            - 'Invoke-Kerberoast'
+            - 'Get-DomainSPNTicket'
+            - 'Request-SPNTicket'
+    selection_ad_module_spn:
+        ScriptBlockText|contains|all:
+            - 'ServicePrincipalName'
+            - 'Get-ADUser'
+    selection_ad_object_spn:
+        ScriptBlockText|contains|all:
+            - 'ServicePrincipalName'
+            - 'Get-ADObject'
+    selection_adsisearcher_spn:
+        ScriptBlockText|contains|all:
+            - 'servicePrincipalName'
+            - '[adsisearcher]'
+    condition: 1 of selection_*
+# medium: SPN enumeration is reconnaissance — no credential material is captured at this stage.
+# Legitimate AD administrators query SPNs for inventory and troubleshooting, raising FP likelihood.
+# PowerView-specific strings (Invoke-Kerberoast, Get-DomainSPNTicket) alone would justify high,
+# but the AD module patterns are common enough in admin scripts to hold this at medium overall.
+# Correlate with subsequent EventID 4769 RC4 ticket requests from the same host to escalate.
+level: medium
+falsepositives:
+    - AD administrators running SPN inventory or cleanup scripts using Get-ADUser/Get-ADObject
+      with ServicePrincipalName filters — baseline expected scripts and scheduled tasks
+    - IAM governance tooling (e.g., BeyondTrust, SailPoint connectors) querying SPNs via
+      PowerShell for entitlement reviews
+    - Monitoring agents or IT automation (Ansible, Chef) collecting AD state via [adsisearcher]
+    - Security posture tools (PingCastle, Purple Knight) that enumerate SPNs for exposure reports
+      — distinguish by well-known service account context and scheduled execution time
+tests:
+    - name: PowerView Invoke-Kerberoast executed via script block
+      log_source:
+          product: windows
+          category: ps_script
+      event:
+          ScriptBlockText: "Import-Module PowerView; Invoke-Kerberoast -OutputFormat Hashcat | Out-File hashes.txt"
+      expected: match
+    - name: Raw adsisearcher LDAP query for SPN-bearing accounts
+      log_source:
+          product: windows
+          category: ps_script
+      event:
+          ScriptBlockText: "$searcher = [adsisearcher]'(&(objectCategory=user)(servicePrincipalName=*))'; $searcher.FindAll()"
+      expected: match
+    - name: Get-ADUser filtering on ServicePrincipalName for Kerberoasting recon
+      log_source:
+          product: windows
+          category: ps_script
+      event:
+          ScriptBlockText: "Get-ADUser -Filter {ServicePrincipalName -ne '$null'} -Properties ServicePrincipalName | Select-Object Name, ServicePrincipalName"
+      expected: match
+    - name: Routine AD account lookup with no SPN context (should not match)
+      log_source:
+          product: windows
+          category: ps_script
+      event:
+          ScriptBlockText: "Get-ADUser -Identity jsmith -Properties DisplayName, Department"
+      expected: no_match

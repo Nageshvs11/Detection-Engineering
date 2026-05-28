@@ -1,0 +1,346 @@
+// ============================================================
+// Use case ID:  Identity-DET-Azure-002_mfa_fatigue_adfs_push_bombing
+// Rule:         002_mfa_fatigue_adfs_push_bombing.kql
+// ATT&CK:       T1621 — Multi-Factor Authentication Request Generation
+// Severity:     high / critical (see graduation below)
+// Author:       Detection KB
+// Date:         2026-05-27
+//
+// Type:         AnalyticRule
+//   Rationale:  Two distinct branches:
+//               Branch A (denial storm, 10+ denials in 1h) — volume threshold is
+//               conservative enough to eliminate accidental single-tap FPs while
+//               catching active push bombing. Deploy directly as AnalyticRule.
+//               Branch B (denial → success chain) — any sign-in success preceded by
+//               denials from the same IP in 30 min has no legitimate explanation.
+//               Deploy as AnalyticRule immediately.
+//
+// Target:       Sentinel
+//   ADFSSignInLogs is a Sentinel-only table (Entra ID connector).
+//   Requires Microsoft Entra ID data connector and AD FS Extranet Lockout
+//   configured to emit sign-in events.
+//   swap TimeGenerated → Timestamp if adapting for a Defender XDR workspace.
+//
+// Schedule:     every 5m
+// Lookback:     1h
+// Suppress:     UserPrincipalName:2h
+//
+// Prerequisite: Microsoft Entra ID data connector must be enabled.
+//               ADFSSignInLogs table must be present and populated.
+//               MFA must be enforced via Conditional Access or per-user MFA —
+//               if MFA is not required, MfaDetail will be empty on all rows.
+//
+// Watchlist exclusions applied:
+//   [x] VPN-Egress-IPs       — excludes known VPN/proxy sources from the IP-
+//                               based denial storm count (VPN reuse from multiple
+//                               users can inflate counts for a shared egress IP)
+//   [x] Service-Accounts     — service accounts should never receive MFA pushes;
+//                               their presence is a misconfiguration, not an attack
+//   [ ] Admin-Workstations   — not applicable; ADFS sign-in events are not
+//                               process-based and don't have a host initiator field
+//   [ ] Sanctioned-Tools     — not applicable for sign-in log rules
+//   [x] High-Value-Assets    — used to elevate severity when a targeted account
+//                               holds a privileged role or manages critical systems
+//
+// False positives:
+//   - User with poor mobile signal repeatedly missing push notifications that
+//     time out → generates "timed out" entries but NOT explicit "denied" entries;
+//     Branch A threshold (10+) and the denial-type filter reduce this significantly
+//   - User deliberately denying pushes they did not initiate (correct behavior)
+//     without reporting to security → Branch A will fire; treat as TP requiring
+//     education and investigation of the source IP
+//   - Automated test frameworks or load-test accounts triggering MFA flows →
+//     add to Service-Accounts watchlist
+//   - Conditional Access policy misconfiguration sending repeated challenges for
+//     a single session → one CorrelationId will have many rows; filter by
+//     dcount(CorrelationId) > 1 to distinguish multi-session from single-session loops
+// ============================================================
+
+// ── Watchlist exclusions ──────────────────────────────────────────────────────
+let ExcludedVPNIPs = toscalar(
+    _GetWatchlist('VPN-Egress-IPs')
+    | summarize make_set(SearchKey));
+let ExcludedServiceAccounts = toscalar(
+    _GetWatchlist('Service-Accounts')
+    | summarize make_set(tolower(SearchKey)));
+let HighValueAssets = toscalar(
+    _GetWatchlist('High-Value-Assets')
+    | summarize make_set(tolower(SearchKey)));
+
+// ── Base dataset: ADFS sign-in attempts where MFA was challenged ──────────────
+// Extract MfaDetail sub-fields (dynamic JSON) into typed columns once,
+// then reuse across both branches.
+let MFAChallenged = ADFSSignInLogs
+| where TimeGenerated > ago(1h)
+| where AuthenticationRequirement == "multiFactorAuthentication"
+// --- watchlist exclusions ---
+| where tolower(UserPrincipalName) !in (ExcludedServiceAccounts)
+// --- structural exclusions ---
+| where isnotempty(UserPrincipalName)
+| where UserPrincipalName !endswith "#EXT#@"       // external guest UPNs
+// --- extract MFA detail fields from dynamic JSON ---
+| extend
+    MfaAuthMethod = tostring(MfaDetail.authMethod),
+    MfaAuthDetail = tostring(MfaDetail.authDetail)
+// --- classify each event's MFA outcome ---
+| extend MfaOutcome = case(
+    ResultType == 0,                                                        "Success",
+    MfaAuthDetail has_any ("declined", "denied"),                           "ExplicitDenial",
+    MfaAuthDetail has_any ("timed out", "didn't respond", "no response"),   "Timeout",
+    ResultType in ("500121", "50076", "50158", "50074"),                    "MfaFailed",
+    ResultType == 0 and isempty(MfaAuthDetail),                             "Success",
+    "Other"
+)
+| where MfaOutcome != "Other"    // keep only events with a meaningful MFA outcome
+| extend SourceIP = coalesce(IPAddress, tostring(NetworkLocationDetails))
+// --- enrich account context from IdentityInfo ---
+| join kind=leftouter (
+    IdentityInfo
+    | where TimeGenerated > ago(7d)
+    | summarize arg_max(TimeGenerated, *) by AccountUPN
+    | project
+        AccountUPN,
+        JobTitle,
+        Department,
+        Manager      = ManagerDisplayName,
+        IsMFARegistered,
+        AssignedRoles,
+        IsAccountEnabled
+) on $left.UserPrincipalName == $right.AccountUPN;
+
+// ── Branch A: MFA denial storm — attack in progress ──────────────────────────
+// Fires when one account accumulates 10+ MFA denials/timeouts from distinct
+// sessions within the lookback window, from a source IP not in the VPN watchlist.
+// 10 is conservative; lower to 5 in high-security environments where any push
+// bombing should alert.
+let DenialThreshold = 10;
+
+let DenialStorm = MFAChallenged
+| where MfaOutcome in ("ExplicitDenial", "Timeout", "MfaFailed")
+| where SourceIP !in (ExcludedVPNIPs)
+| summarize
+    DenialCount      = count(),
+    ExplicitDenials  = countif(MfaOutcome == "ExplicitDenial"),
+    Timeouts         = countif(MfaOutcome == "Timeout"),
+    DistinctSessions = dcount(CorrelationId),
+    MfaMethods       = make_set(MfaAuthMethod, 5),
+    DenialDetails    = make_set(MfaAuthDetail, 10),
+    FirstDenial      = min(TimeGenerated),
+    LastDenial       = max(TimeGenerated),
+    SourceIPs        = make_set(SourceIP, 10),
+    // carry enrichment columns through the summarize
+    JobTitle         = take_any(JobTitle),
+    Department       = take_any(Department),
+    Manager          = take_any(Manager),
+    IsMFARegistered  = take_any(IsMFARegistered),
+    AssignedRoles    = take_any(AssignedRoles)
+    by UserPrincipalName
+| where DenialCount >= DenialThreshold
+// Require at least 2 distinct sessions — single-session loops are a CA policy
+// misconfiguration, not push bombing. Multi-session = attacker re-authenticating.
+| where DistinctSessions >= 2
+| extend
+    DetectionBranch = "DenialStorm",
+    // Elevate to Critical if the account holds a privileged role
+    IsPrivilegedAccount = AssignedRoles has_any (
+        "Global Administrator", "Privileged Role Administrator",
+        "Security Administrator", "Exchange Administrator",
+        "SharePoint Administrator", "Conditional Access Administrator"
+    ),
+    Severity = case(
+        ExplicitDenials >= 5 and IsPrivilegedAccount, "Critical",
+        ExplicitDenials >= 5,                          "High",
+        "High"
+    ),
+    AttackStatus = "InProgress — user has not approved; monitor for approval"
+| project
+    DetectionBranch,
+    Severity,
+    AttackStatus,
+    UserPrincipalName,
+    DenialCount,
+    ExplicitDenials,
+    Timeouts,
+    DistinctSessions,
+    MfaMethods,
+    DenialDetails,
+    SourceIPs,
+    FirstDenial,
+    LastDenial,
+    JobTitle,
+    Department,
+    Manager,
+    IsMFARegistered,
+    AssignedRoles,
+    IsPrivilegedAccount;
+
+// ── Branch B: MFA fatigue succeeded — denial chain then sign-in success ───────
+// Fires when a user had MFA denials in the window AND subsequently had a
+// successful sign-in from the same or a different source IP.
+// Any success after explicit denials is anomalous — the user either approved
+// under duress or an attacker session got through on a different device.
+let FatigueSuccess = MFAChallenged
+| where MfaOutcome in ("ExplicitDenial", "Timeout", "MfaFailed")
+| where SourceIP !in (ExcludedVPNIPs)
+| summarize
+    DenialCount     = count(),
+    ExplicitDenials = countif(MfaOutcome == "ExplicitDenial"),
+    DenialIPs       = make_set(SourceIP, 10),
+    FirstDenial     = min(TimeGenerated),
+    LastDenial      = max(TimeGenerated),
+    MfaMethods      = make_set(MfaAuthMethod, 5),
+    DenialDetails   = make_set(MfaAuthDetail, 10),
+    JobTitle        = take_any(JobTitle),
+    Department      = take_any(Department),
+    Manager         = take_any(Manager),
+    IsMFARegistered = take_any(IsMFARegistered),
+    AssignedRoles   = take_any(AssignedRoles)
+    by UserPrincipalName
+| where DenialCount >= 3   // lower bar than Branch A — success after 3 denials is already suspicious
+// --- join to successful sign-ins for the same user in the same window ---
+| join kind=inner (
+    ADFSSignInLogs
+    | where TimeGenerated > ago(1h)
+    | where ResultType == 0
+    | where AuthenticationRequirement == "multiFactorAuthentication"
+    | where tolower(UserPrincipalName) !in (ExcludedServiceAccounts)
+    | project
+        UserPrincipalName,
+        SuccessTime     = TimeGenerated,
+        SuccessIP       = coalesce(IPAddress, ""),
+        SuccessApp      = AppDisplayName,
+        SuccessCorrelId = CorrelationId
+) on UserPrincipalName
+// Success must come AFTER the first denial, within the same 1h window
+| where SuccessTime > FirstDenial
+| extend
+    DetectionBranch = "FatigueSuccess",
+    // Always Critical — this is a confirmed account takeover scenario
+    Severity        = "Critical",
+    IsPrivilegedAccount = AssignedRoles has_any (
+        "Global Administrator", "Privileged Role Administrator",
+        "Security Administrator", "Exchange Administrator",
+        "SharePoint Administrator", "Conditional Access Administrator"
+    ),
+    AttackStatus    = strcat(
+        "SUCCEEDED — MFA approved after ", DenialCount,
+        " denials. Successful sign-in at ", tostring(SuccessTime),
+        " from IP ", SuccessIP
+    ),
+    // Flag if the success IP differs from all denial IPs — attacker on different device
+    SuccessIPDiffers = SuccessIP !in (DenialIPs)
+| summarize arg_max(SuccessTime, *) by UserPrincipalName    // one row per user
+| project
+    DetectionBranch,
+    Severity,
+    AttackStatus,
+    UserPrincipalName,
+    DenialCount,
+    ExplicitDenials,
+    DenialIPs,
+    SuccessIP,
+    SuccessIPDiffers,
+    SuccessApp,
+    MfaMethods,
+    DenialDetails,
+    FirstDenial,
+    LastDenial,
+    SuccessTime,
+    JobTitle,
+    Department,
+    Manager,
+    IsMFARegistered,
+    AssignedRoles,
+    IsPrivilegedAccount;
+
+// ── Union branches and emit final alert rows ──────────────────────────────────
+DenialStorm
+| union FatigueSuccess
+// ── Severity amplifier: high-value asset ─────────────────────────────────────
+| extend IsCriticalAsset = tolower(UserPrincipalName) in (HighValueAssets)
+| extend Severity = iff(IsCriticalAsset and Severity == "High", "Critical", Severity)
+// ── Rule metadata ─────────────────────────────────────────────────────────────
+| extend
+    ATT_CK  = "T1621",
+    RuleID  = "Identity-DET-Azure-002_mfa_fatigue_adfs_push_bombing",
+    Triage  = strcat(
+        "1. Contact '", UserPrincipalName, "' immediately — did they approve an MFA push ",
+        "they did not initiate? ",
+        "2. If FatigueSuccess: treat as active account takeover. Revoke all sessions now: ",
+        "Entra ID → Users → Revoke sessions. Force password reset. ",
+        "3. Block source IP(s): ", tostring(SourceIPs), " in Conditional Access named locations. ",
+        "4. If DenialStorm: user is being actively targeted. Enable number matching and ",
+        "additional context in Microsoft Authenticator to make approval harder. ",
+        "5. Review SigninLogs and AADNonInteractiveUserSignInLogs for the same account ",
+        "in the past 7d for credential spray attempts preceding this event. ",
+        "6. Check if the account is in a privileged role — IsPrivilegedAccount: ",
+        tostring(IsPrivilegedAccount)
+    )
+// ── Entity fields ─────────────────────────────────────────────────────────────
+// Sentinel entity mapping:
+//   Account → AccountName + AccountDomain (split UserPrincipalName)
+//   IP      → SourceIP (from DenialStorm) or SuccessIP (from FatigueSuccess)
+| extend
+    AccountName   = tostring(split(UserPrincipalName, "@")[0]),
+    AccountDomain = tostring(split(UserPrincipalName, "@")[1])
+// ── Output ────────────────────────────────────────────────────────────────────
+| project-reorder
+    Severity,
+    DetectionBranch,
+    AttackStatus,
+    UserPrincipalName,
+    AccountName,
+    AccountDomain,
+    DenialCount,
+    ExplicitDenials,
+    IsPrivilegedAccount,
+    IsCriticalAsset,
+    MfaMethods,
+    DenialDetails,
+    JobTitle,
+    Department,
+    Manager,
+    IsMFARegistered,
+    AssignedRoles,
+    FirstDenial,
+    LastDenial,
+    ATT_CK,
+    RuleID,
+    Triage
+| sort by Severity asc, DenialCount desc
+
+// ============================================================
+// TEST CASES
+//
+// Branch A — Positive (High): denial storm, non-privileged account
+//   UserPrincipalName: alice@contoso.com
+//   12 events, all MfaOutcome=ExplicitDenial, DistinctSessions=4
+//   AssignedRoles: (none)
+//   Expected: DetectionBranch=DenialStorm, Severity=High
+//
+// Branch A — Positive (Critical): denial storm, privileged account
+//   UserPrincipalName: bob@contoso.com
+//   15 events, ExplicitDenials=8, DistinctSessions=3
+//   AssignedRoles: "Global Administrator"
+//   Expected: DetectionBranch=DenialStorm, Severity=Critical
+//
+// Branch B — Positive (Critical): fatigue succeeded
+//   UserPrincipalName: carol@contoso.com
+//   5 denials from 203.0.113.10, then ResultType=0 (success) at T+25min
+//   SuccessIPDiffers = true (success from different IP)
+//   Expected: DetectionBranch=FatigueSuccess, Severity=Critical
+//
+// Negative — should NOT fire: below threshold
+//   UserPrincipalName: dave@contoso.com
+//   8 MFA denials, DistinctSessions=1 (single CA policy loop, not bombing)
+//   Expected: filtered by DistinctSessions >= 2 check
+//
+// Negative — should NOT fire: service account
+//   UserPrincipalName: svc_sync@contoso.com (in Service-Accounts watchlist)
+//   Expected: filtered by ExcludedServiceAccounts watchlist join
+//
+// Negative — should NOT fire: timeouts only, below threshold
+//   UserPrincipalName: eve@contoso.com
+//   6 Timeout events, 0 ExplicitDenials, DistinctSessions=2
+//   Expected: DenialCount=6 < DenialThreshold=10, no alert
+// ============================================================

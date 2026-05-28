@@ -1,0 +1,84 @@
+title: LSASS Memory Access via MiniDumpWriteDump API
+id: a7f6e3b2-4d1c-4f8e-9a2b-3c5d7e9f0b12
+status: experimental
+description: >
+    Detects any process opening LSASS where the Sysmon call trace contains
+    dbghelp.dll or dbgcore.dll — the DLLs that implement MiniDumpWriteDump.
+    This catches tools that invoke the native Windows MiniDump API directly
+    (ProcDump, custom loaders, reflective PE injectors) regardless of the
+    calling binary name or granted access mask, complementing access-mask-based
+    rules that are trivially bypassed by requesting minimal rights.
+references:
+    - https://attack.mitre.org/techniques/T1003/001/
+    - https://docs.microsoft.com/en-us/windows/win32/api/minidumpapiset/nf-minidumpapiset-minidumpwritedump
+    - https://www.deepinstinct.com/blog/lsass-memory-dumps-are-stealthier-than-ever-before
+    - https://modexp.wordpress.com/2019/08/30/minidumpwritedump-via-com-services-dll/
+author: Detection KB
+date: 2026-05-27
+tags:
+    - attack.credential-access
+    - attack.t1003.001
+logsource:
+    category: process_access
+    product: windows
+detection:
+    selection:
+        TargetImage|endswith: '\lsass.exe'
+        CallTrace|contains:
+            - 'dbghelp.dll'
+            - 'dbgcore.dll'
+    filter_wer:
+        SourceImage|endswith:
+            - '\WerFault.exe'
+            - '\WerFaultSecure.exe'
+    filter_edr:
+        SourceImage|endswith:
+            - '\MsMpEng.exe'
+            - '\SenseIR.exe'
+            - '\SenseCncProxy.exe'
+    condition: selection and not filter_wer and not filter_edr
+# high: any process using MiniDumpWriteDump against LSASS is a direct credential extraction path;
+# no production software calls this API on lsass.exe at runtime except WER (crash reporting)
+# and EDR engines — both filtered. Potential for unknown legitimate callers keeps this
+# below critical, but confirmed hits warrant immediate escalation.
+level: high
+falsepositives:
+    - Windows Error Reporting (WerFault.exe, WerFaultSecure.exe) collecting an LSASS crash
+      diagnostic — filtered by default; alert fires only if these binaries are spoofed or renamed
+    - EDR and AV engines (Defender MsMpEng.exe, Sentinel SenseIR.exe) performing live memory
+      inspection — filtered; add your vendor's binary to filter_edr if it triggers
+    - Authorized incident-response use of SysInternals ProcDump (procdump -ma lsass.exe) —
+      distinguish by SourceImage path, user context, and whether a change ticket exists
+    - Crash dump utilities embedded in third-party monitoring agents (rare) — verify SourceImage
+      and vendor before adding to the filter block
+tests:
+    - name: Custom dumper binary calls MiniDumpWriteDump against LSASS
+      log_source:
+          product: windows
+          category: process_access
+      event:
+          TargetImage: 'C:\Windows\System32\lsass.exe'
+          SourceImage: 'C:\Users\attacker\tools\dumper.exe'
+          GrantedAccess: '0x1FFFFF'
+          CallTrace: 'C:\Windows\System32\ntdll.dll+0x9abc0|C:\Windows\System32\dbghelp.dll+MiniDumpWriteDump|C:\Users\attacker\tools\dumper.exe+0x1234'
+      expected: match
+    - name: ProcDump -ma targeting LSASS (dbgcore path)
+      log_source:
+          product: windows
+          category: process_access
+      event:
+          TargetImage: 'C:\Windows\System32\lsass.exe'
+          SourceImage: 'C:\Windows\Temp\procdump.exe'
+          GrantedAccess: '0x1FFFFF'
+          CallTrace: 'C:\Windows\System32\ntdll.dll+0x9abc0|C:\Windows\System32\dbgcore.dll+0x5678|C:\Windows\Temp\procdump.exe+0x9abc'
+      expected: match
+    - name: WerFault collecting LSASS crash dump (legitimate, filtered)
+      log_source:
+          product: windows
+          category: process_access
+      event:
+          TargetImage: 'C:\Windows\System32\lsass.exe'
+          SourceImage: 'C:\Windows\System32\WerFault.exe'
+          GrantedAccess: '0x1410'
+          CallTrace: 'C:\Windows\System32\ntdll.dll+0x9abc0|C:\Windows\System32\dbghelp.dll+MiniDumpWriteDump'
+      expected: no_match

@@ -1,0 +1,22 @@
+# Python
+*.pyc
+*.pyo
+__pycache__/
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# SigmaHQ community clone — referenced locally, not tracked in this repo
+sigma-rules/
+
+# Claude local settings (session-specific, not for sharing)
+.claude/settings.local.json
+
+# OS / editor
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
