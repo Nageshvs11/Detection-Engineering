@@ -25,41 +25,6 @@ Detection-Engineering/
 └── .claude/skills/             # Detection engineering skill definitions
 ```
 
----
-
-## Detection Coverage
-
-### KQL Rules
-
-| File | Use Case ID | ATT&CK | Platform | Severity |
-|---|---|---|---|---|
-| `kql/identity/001_dcsync_non_dc.kql` | OS-DET-AD-001 | T1003.006 — DCSync | Sentinel / Defender XDR | Critical |
-| `kql/identity/002_mfa_fatigue_adfs_push_bombing.kql` | Identity-DET-Azure-002 | T1621 — MFA Request Generation | Sentinel | High / Critical |
-| `kql/windows/001_pass_the_hash_ntlm_lateral_movement.kql` | OS-DET-WIN-001 | T1550.002 — Pass the Hash | Sentinel / Defender XDR | High / Critical |
-| `kql/windows/002_handala_wiper_chain.kql` | OS-DET-WIN-002 | T1485 — Data Destruction | Sentinel / Defender XDR | Critical |
-| `kql/cloud/001_impossible_travel_login.kql` | Cloud-DET-Azure-001 | T1078 — Valid Accounts | Sentinel | High |
-
-### Sigma Rules (`rules/`)
-
-| Category | Rules |
-|---|---|
-| Credential Access — LSASS | `proc_access_win_lsass_memdump.yml`, `proc_access_win_lsass_minidump_api.yml`, `proc_access_win_lsass_dump_comsvcs_dll.yml`, `proc_access_win_lsass_susp_access_flag.yml`, `proc_access_win_hktl_handlekatz_lsass_access.yml` |
-| Credential Access — Dumping tools | `proc_creation_win_lsass_dump_procdump.yml`, `proc_creation_win_sysinternals_procdump_lsass.yml`, `proc_creation_win_rundll32_process_dump_via_comsvcs.yml`, `rules/win_security_susp_lsass_dump_generic.yml` |
-| Credential Access — Mimikatz | `proc_creation_win_hktl_mimikatz_command_line.yml` |
-| Credential Access — Kerberos | `win_security_kerberoasting_activity.yml`, `win_security_kerberoasting_rc4.yml`, `win_security_susp_rc4_kerberos.yml`, `posh_ps_spn_enumeration_kerberoasting.yml`, `posh_ps_request_kerberos_ticket.yml`, `proc_creation_win_setspn_spn_enumeration.yml` |
-| Lateral Movement | `win_security_pass_the_hash.yml`, `win_security_pass_the_hash_2.yml`, `win_security_overpass_the_hash.yml`, `win_susp_ntlm_auth.yml` |
-| Privilege Escalation | `win_security_golden_ticket.yml` |
-| Active Directory | `win_security_dcsync.yml`, `win_security_ad_replication_non_machine_account.yml` |
-| Offensive Tools | `posh_ps_hktl_rubeus.yml`, `proc_creation_win_hktl_rubeus.yml`, `pipe_created_hktl_generic_cred_dump_tools_pipes.yml`, `file_event_win_lsass_default_dump_file_names.yml` |
-
-### YARA Rules (`yara/`)
-
-| File | Target | Description |
-|---|---|---|
-| `MAL_Win_CobaltStrike_Beacon_May26.yar` | Windows PE | CobaltStrike Beacon detection |
-
----
-
 ## KQL Rule Design
 
 Each KQL rule follows a standard structure:
@@ -71,18 +36,6 @@ Each KQL rule follows a standard structure:
 - **Deduplication** — `summarize + arg_max(TimeGenerated, *)` ensures one row per entity per alert window
 - **Triage guidance** — every rule includes a `Triage` field with step-by-step analyst instructions
 
-### Sentinel Watchlists
-
-| Watchlist | Purpose | Rules that use it |
-|---|---|---|
-| `VPN-Egress-IPs` | Corporate VPN gateway and ZTNA egress IPs | Network, identity, cloud rules |
-| `Vuln-Scanner-IPs` | Nessus, Qualys, Rapid7, OpenVAS scanner IPs | Any rule with a source IP field |
-| `BAS-IPs` | SafeBreach, AttackIQ, Cymulate, XM Cyber agent and controller IPs | Any rule with a source IP field |
-| `Service-Accounts` | Non-human accounts — service, automation, sync accounts | Every identity, sign-in, and process rule |
-| `Admin-Workstations` | PAW machines, jump hosts, bastion servers | Endpoint, lateral movement, credential access rules |
-| `Sanctioned-Tools` | Approved security and admin tool process names | Process creation, execution, defense evasion rules |
-| `High-Value-Assets` | Domain controllers, CA servers, PAM servers, crown-jewel assets | All rules — severity graduation |
-
 ---
 
 ## SPL Rule Design
@@ -93,18 +46,6 @@ SPL rules (added to `splunk/` as they are written) follow the same principles ad
 - **Context-aware lookup exclusions** — seven standard lookup CSVs mirror the Sentinel Watchlists and are applied based on the rule's focus area (see Exclusion Matrix below)
 - **Rule type** — `CorrelationSearch` (creates notable event) or `SavedSearch` (analyst-reviewed report)
 - **RBA support** — high-volume signals use the Risk-Based Alerting pattern (`risk_object`, `risk_score`, `risk_index`) instead of direct notable events
-
-### Splunk Lookup CSVs
-
-| CSV file | Purpose | Rules that use it |
-|---|---|---|
-| `vpn_egress_ips.csv` | Corporate VPN gateway and ZTNA egress IPs | Network, identity, cloud rules |
-| `vuln_scanner_ips.csv` | Nessus, Qualys, Rapid7, OpenVAS scanner IPs | Any rule with a `src_ip` or `dest_ip` field |
-| `bas_ips.csv` | SafeBreach, AttackIQ, Cymulate, XM Cyber agent and controller IPs | Any rule with a `src_ip` or `dest_ip` field |
-| `service_accounts.csv` | Non-human accounts — service, automation, sync accounts | Every identity, sign-in, and process rule |
-| `admin_workstations.csv` | PAW machines, jump hosts, bastion servers | Endpoint, lateral movement, credential access rules |
-| `sanctioned_tools.csv` | Approved security and admin tool process names | Process creation, execution, defense evasion rules |
-| `high_value_assets.csv` | Domain controllers, CA servers, PAM servers, crown-jewel assets | All rules — severity graduation |
 
 ---
 
