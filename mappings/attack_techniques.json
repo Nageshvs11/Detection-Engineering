@@ -2479,7 +2479,8 @@
     ],
     "url": "https://attack.mitre.org/techniques/T1110/003",
     "rules": [
-      "Identity-DET-Azure-003_password_spray"
+      "Identity-DET-Azure-003_password_spray",
+      "Identity-DET-Azure-004_attack_chain_credential_access"
     ]
   },
   "T1090.002": {
@@ -3444,7 +3445,8 @@
     ],
     "url": "https://attack.mitre.org/techniques/T1621",
     "rules": [
-      "Identity-DET-Azure-002_mfa_fatigue_adfs_push_bombing"
+      "Identity-DET-Azure-002_mfa_fatigue_adfs_push_bombing",
+      "Identity-DET-Azure-004_attack_chain_credential_access"
     ]
   },
   "T1554": {
@@ -5428,7 +5430,11 @@
       "privilege-escalation",
       "initial-access"
     ],
-    "url": "https://attack.mitre.org/techniques/T1078/004"
+    "url": "https://attack.mitre.org/techniques/T1078/004",
+    "rules": [
+      "Cloud-DET-Azure-001_impossible_travel_login",
+      "Identity-DET-Azure-004_attack_chain_credential_access"
+    ]
   },
   "T1480.001": {
     "name": "Environmental Keying",

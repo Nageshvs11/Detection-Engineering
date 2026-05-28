@@ -39,6 +39,7 @@ watchlists:
     - Vuln-Scanner-IPs
     - BAS-IPs
     - Service-Accounts
+    - Sanctioned-Apps
     - High-Value-Assets
 
 falsepositives:
@@ -56,6 +57,9 @@ kql_query: |
     let ExcludedServiceAccounts = toscalar(
         _GetWatchlist('Service-Accounts')
         | summarize make_set(tolower(SearchKey)));
+    let SanctionedApps = toscalar(
+        _GetWatchlist('Sanctioned-Apps')
+        | summarize make_set(tolower(SearchKey)));
     let HighValueAssets = toscalar(
         _GetWatchlist('High-Value-Assets')
         | summarize make_set(tolower(SearchKey)));
@@ -71,6 +75,7 @@ kql_query: |
     // --- structural exclusions ---
     | where isnotempty(UserPrincipalName)
     | where UserPrincipalName !endswith "#EXT#@"       // external guest UPNs
+    | where tolower(AppDisplayName) !in (SanctionedApps)
     // --- extract MFA detail fields from dynamic JSON ---
     | extend
         MfaAuthMethod = tostring(MfaDetail.authMethod),
@@ -337,3 +342,61 @@ kql_query: |
     //   6 Timeout events, 0 ExplicitDenials, DistinctSessions=2
     //   Expected: DenialCount=6 < DenialThreshold=10, no alert
     // ============================================================
+
+tests:
+    - name: MFA denial storm — non-privileged account (High)
+      log_source:
+          product: azure
+          service: adfs_sign_in_logs
+      event:
+          UserPrincipalName: alice@contoso.com
+          AuthenticationRequirement: multiFactorAuthentication
+          MfaAuthDetail: declined
+          DenialCount: 12
+          DistinctSessions: 4
+          AssignedRoles: ""
+      expected: match
+
+    - name: MFA fatigue succeeded — denial chain then successful sign-in (Critical)
+      log_source:
+          product: azure
+          service: adfs_sign_in_logs
+      event:
+          UserPrincipalName: carol@contoso.com
+          AuthenticationRequirement: multiFactorAuthentication
+          MfaAuthDetail: declined
+          DenialCount: 5
+          ResultType: 0
+          SuccessTime: after_first_denial
+      expected: match
+
+    - name: Single CA policy loop — should NOT fire (DistinctSessions=1)
+      log_source:
+          product: azure
+          service: adfs_sign_in_logs
+      event:
+          UserPrincipalName: dave@contoso.com
+          DenialCount: 8
+          DistinctSessions: 1
+      expected: no_match
+
+    - name: Service account — should NOT fire (in Service-Accounts watchlist)
+      log_source:
+          product: azure
+          service: adfs_sign_in_logs
+      event:
+          UserPrincipalName: svc_sync@contoso.com
+          DenialCount: 15
+          DistinctSessions: 3
+      expected: no_match
+
+    - name: Sanctioned app MFA flow — should NOT fire
+      log_source:
+          product: azure
+          service: adfs_sign_in_logs
+      event:
+          UserPrincipalName: user@contoso.com
+          AppDisplayName: veeam-backup-agent    # in Sanctioned-Apps watchlist
+          DenialCount: 12
+          DistinctSessions: 4
+      expected: no_match

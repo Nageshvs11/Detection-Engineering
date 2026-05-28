@@ -37,9 +37,11 @@ All rules are authored as `.yml` files following the Sigma YAML schema. KQL rule
 |---|---|---|---|---|
 | `kql/identity/001_dcsync_non_dc.yml` | OS-DET-AD-001 | T1003.006 — DCSync | Sentinel / Defender XDR | Critical |
 | `kql/identity/002_mfa_fatigue_adfs_push_bombing.yml` | Identity-DET-Azure-002 | T1621 — MFA Request Generation | Sentinel | High / Critical |
+| `kql/identity/003_password_spray.yml` | Identity-DET-Azure-003 | T1110.003 — Password Spray | Sentinel | High / Critical |
+| `kql/identity/004_attack_chain_credential_access.yml` | Identity-DET-Azure-004 | T1110.003 · T1621 · T1078.004 — Correlated chain | Sentinel | High / Critical |
 | `kql/windows/001_pass_the_hash_ntlm_lateral_movement.yml` | OS-DET-WIN-001 | T1550.002 — Pass the Hash | Sentinel / Defender XDR | High / Critical |
 | `kql/windows/002_handala_wiper_chain.yml` | OS-DET-WIN-002 | T1485 — Data Destruction | Sentinel / Defender XDR | Critical |
-| `kql/cloud/001_impossible_travel_login.yml` | Cloud-DET-Azure-001 | T1078 — Valid Accounts | Sentinel | High |
+| `kql/cloud/001_impossible_travel_login.yml` | Cloud-DET-Azure-001 | T1078.004 — Cloud Accounts | Sentinel | High / Critical |
 
 ### Sigma Rules (`rules/`)
 
@@ -83,6 +85,7 @@ Each KQL rule follows a standard structure:
 | `Service-Accounts` | Non-human accounts — service, automation, sync accounts | Every identity, sign-in, and process rule |
 | `Admin-Workstations` | PAW machines, jump hosts, bastion servers | Endpoint, lateral movement, credential access rules |
 | `Sanctioned-Tools` | Approved security and admin tool process names | Process creation, execution, defense evasion rules |
+| `Sanctioned-Apps` | Approved app names (AppDisplayName) — backup agents, sync tools, SIEM connectors | Identity, cloud, MFA rules |
 | `High-Value-Assets` | Domain controllers, CA servers, PAM servers, crown-jewel assets | All rules — severity graduation |
 
 ---
@@ -117,11 +120,11 @@ Every rule applies exclusions based on its focus area. The matrix below determin
 | Rule focus | Required exclusions | Why |
 |---|---|---|
 | **Network** (firewall, proxy, DNS, IDS/IPS) | VPN IPs · Scanner IPs · BAS IPs | Scanners and BAS tools generate high-volume authorized traffic that matches network detection patterns |
-| **Identity / Authentication** (sign-in, MFA, LDAP, Kerberos) | Service accounts · VPN IPs · Scanner IPs · BAS IPs | Scanner/BAS auth attempts look identical to credential spray; service accounts authenticate at high frequency |
+| **Identity / Authentication** (sign-in, MFA, LDAP, Kerberos) | Service accounts · VPN IPs · Scanner IPs · BAS IPs · Sanctioned apps | Scanner/BAS auth attempts look identical to credential spray; approved apps (backup, sync) legitimately authenticate across many accounts |
 | **Process Execution** (process creation, script execution) | Service accounts · Admin workstations · Sanctioned tools | Admins and approved tooling run the same binaries attackers abuse |
 | **Credential Access** (LSASS, SAM, DPAPI) | Service accounts · Admin workstations · Sanctioned tools · Scanner IPs · BAS IPs | Scanners and BAS tools probe credential stores as part of authorized assessments |
 | **Lateral Movement** (PsExec, WMI, SMB, RDP) | Service accounts · Admin workstations · Scanner IPs · BAS IPs | Scanners enumerate SMB/RDP; admins use the same remote management tools |
-| **Cloud** (Azure/AWS/GCP API, resource change) | Service accounts · VPN IPs · Scanner IPs · BAS IPs | Cloud assessment tools and automation accounts generate high-volume authorized API calls |
+| **Cloud** (Azure/AWS/GCP API, resource change) | Service accounts · VPN IPs · Scanner IPs · BAS IPs · Sanctioned apps | Cloud assessment tools, automation accounts, and approved cloud-connector apps generate high-volume authorized API calls |
 | **Endpoint / EDR** (file, registry, injection) | Service accounts · Admin workstations · Sanctioned tools · BAS IPs | BAS agents run directly on endpoints and execute the same artifacts as real attackers |
 | **PAM / Privileged Access** | Service accounts · Scanner IPs · BAS IPs | Password rotation scripts and BAS credential-testing modules interact directly with PAM APIs |
 | **All rules** | High-Value-Assets | Severity graduation — always applied, never used as exclusion |
@@ -130,6 +133,7 @@ Every rule applies exclusions based on its focus area. The matrix below determin
 - Rule has a source IP field → always add VPN + scanner + BAS IPs
 - Rule has a user/account field → always add service accounts
 - Rule targets process execution or endpoint activity → always add admin workstations + sanctioned tools
+- Rule targets sign-in, MFA, or cloud API activity → always add sanctioned apps
 
 ---
 

@@ -21,7 +21,7 @@ logsource:
 detection:
     selection:
         ResultType: 0
-            IsInteractive: true
+        IsInteractive: true
     condition: selection
 
 platform: sentinel
@@ -39,12 +39,14 @@ watchlists:
     - Vuln-Scanner-IPs
     - BAS-IPs
     - Service-Accounts
+    - Sanctioned-Apps
     - High-Value-Assets
 
 falsepositives:
     - VPN/proxy users appearing to originate from the VPN egress country — mitigated by VPN-Egress-IPs watchlist
     - Split-tunnel VPN: corporate traffic via VPN, personal traffic direct — generates two source IPs
     - IPv6 geolocation inaccuracy causing false distance calculation — filter by IPAddressFromResourceProvider
+    - Cloud-sync and backup applications authenticating globally on behalf of many accounts — mitigated by Sanctioned-Apps watchlist
 
 # Impossible travel is a strong indicator of credential compromise or session hijacking; confirmed events require immediate investigation
 level: high
@@ -52,7 +54,17 @@ level: high
 kql_query: |
     let TravelWindow    = 1h;    // sign-ins this close together from different countries = alert
     let LookbackPeriod  = 1d;    // how far back to search for sign-in pairs
-    
+
+    // ── Watchlist exclusions ──────────────────────────────────────────────────────
+    let ExcludedVPNIPs = toscalar(
+        _GetWatchlist('VPN-Egress-IPs') | summarize make_set(SearchKey));
+    let ExcludedServiceAccounts = toscalar(
+        _GetWatchlist('Service-Accounts') | summarize make_set(tolower(SearchKey)));
+    let SanctionedApps = toscalar(
+        _GetWatchlist('Sanctioned-Apps') | summarize make_set(tolower(SearchKey)));
+    let HighValueAssets = toscalar(
+        _GetWatchlist('High-Value-Assets') | summarize make_set(tolower(SearchKey)));
+
     // ── Base dataset: successful Azure AD sign-ins with valid location data ───────
     let SignIns = SignInLogs
     | where TimeGenerated > ago(LookbackPeriod)
@@ -67,6 +79,9 @@ kql_query: |
     // --- noise reduction: exclude known automation and non-interactive sign-in types ---
     | where UserType != "Guest"                                // guests often connect globally by design
     | where ClientAppUsed !in ("ROPC", "Legacy Authentication protocols") // exclude legacy noise
+    | where tolower(UserPrincipalName) !in (ExcludedServiceAccounts)
+    | where IPAddress !in (ExcludedVPNIPs)
+    | where tolower(AppDisplayName) !in (SanctionedApps)       // cloud-sync apps intentionally sign in globally
     | project
         TimeGenerated,
         UserPrincipalName,
@@ -165,26 +180,67 @@ kql_query: |
         Triage
     
     // ============================================================
-    // TEST CASES
-    //
-    // Positive — should fire:
-    //   UserPrincipalName: john.doe@contoso.com
-    //   Sign-in 1: 2026-05-27T08:00:00Z | Country: UAE  | IP: 185.x.x.x | ResultType: 0
-    //   Sign-in 2: 2026-05-27T08:45:00Z | Country: USA  | IP: 104.x.x.x | ResultType: 0
-    //   TimeDelta: 45 min — physically impossible → Severity: High
-    //
-    // Positive (critical path) — should fire as Critical:
-    //   Sign-in 1: 2026-05-27T09:00:00Z | Country: UAE  | ResultType: 0
-    //   Sign-in 2: 2026-05-27T09:07:00Z | Country: Russia | ResultType: 0
-    //   TimeDelta: 7 min + elevated risk score → Severity: Critical
-    //
-    // Negative — should NOT fire:
-    //   Sign-in 1: 2026-05-27T08:00:00Z | Country: UAE  | ResultType: 0
-    //   Sign-in 2: 2026-05-27T10:30:00Z | Country: India | ResultType: 0
-    //   TimeDelta: 150 min → outside TravelWindow (1h), no alert
-    //
-    // Negative — should NOT fire:
-    //   Sign-in 1: 2026-05-27T08:00:00Z | Country: UAE | ResultType: 0
-    //   Sign-in 2: 2026-05-27T08:30:00Z | Country: UAE | ResultType: 0
-    //   Same country → no alert
+    // TEST CASES — see inline tests: block below
     // ============================================================
+
+tests:
+    - name: Impossible travel — different countries within 45 minutes
+      log_source:
+          product: azure
+          service: sign_in_logs
+      event:
+          UserPrincipalName: john.doe@contoso.com
+          ResultType: 0
+          Country1: UAE
+          Country2: USA
+          TimeDelta_min: 45
+      expected: match
+
+    - name: Impossible travel — 7 minutes, elevated risk (Critical path)
+      log_source:
+          product: azure
+          service: sign_in_logs
+      event:
+          UserPrincipalName: jane.doe@contoso.com
+          ResultType: 0
+          Country1: UAE
+          Country2: Russia
+          TimeDelta_min: 7
+          RiskLevelDuringSignIn: high
+      expected: match
+
+    - name: Same country sign-ins — should NOT fire
+      log_source:
+          product: azure
+          service: sign_in_logs
+      event:
+          UserPrincipalName: user@contoso.com
+          ResultType: 0
+          Country1: UAE
+          Country2: UAE
+          TimeDelta_min: 30
+      expected: no_match
+
+    - name: Travel gap outside window (150 min) — should NOT fire
+      log_source:
+          product: azure
+          service: sign_in_logs
+      event:
+          UserPrincipalName: traveler@contoso.com
+          ResultType: 0
+          Country1: UAE
+          Country2: India
+          TimeDelta_min: 150
+      expected: no_match
+
+    - name: Sanctioned cloud-sync app — should NOT fire
+      log_source:
+          product: azure
+          service: sign_in_logs
+      event:
+          UserPrincipalName: user@contoso.com
+          AppDisplayName: azure-ad-connect-sync   # in Sanctioned-Apps watchlist
+          Country1: USA
+          Country2: Ireland
+          TimeDelta_min: 20
+      expected: no_match

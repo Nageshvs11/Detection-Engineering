@@ -198,6 +198,7 @@ KQL-specific and SPL-specific production requirements.
         [ ] Service-Accounts     (identity, process, credential access rules)
         [ ] Admin-Workstations   (endpoint, lateral movement, credential access rules)
         [ ] Sanctioned-Tools     (process creation, execution, defense evasion rules)
+        [ ] Sanctioned-Apps      (identity, cloud, MFA rules — approved apps authenticating across many accounts)
         [ ] High-Value-Assets    (every rule — severity graduation)
         See "Exclusion Application Matrix"; absent block must be justified in the rule header
 [ ] K5. Final output deduplicated — summarize + arg_max before project
@@ -271,11 +272,11 @@ exclusion block — or a documented justification for why it was omitted.
 | Rule focus | Required exclusions | Rationale |
 |---|---|---|
 | **Network** (firewall, proxy, DNS, IDS/IPS, traffic logs) | `VPN-Egress-IPs`, `Vuln-Scanner-IPs`, `BAS-IPs` | Scanners and BAS tools generate high-volume authorized traffic that matches network detection patterns |
-| **Identity / Authentication** (sign-in, MFA, SSO, LDAP, Kerberos) | `Service-Accounts`, `VPN-Egress-IPs`, `Vuln-Scanner-IPs`, `BAS-IPs` | Scanner/BAS authentication attempts look identical to credential spray; service accounts legitimately authenticate at high frequency |
+| **Identity / Authentication** (sign-in, MFA, SSO, LDAP, Kerberos) | `Service-Accounts`, `VPN-Egress-IPs`, `Vuln-Scanner-IPs`, `BAS-IPs`, `Sanctioned-Apps` | Scanner/BAS auth attempts look identical to credential spray; service accounts authenticate at high frequency; approved apps (backup, sync) auth across many accounts |
 | **Process Execution** (process creation, script execution, command line) | `Service-Accounts`, `Admin-Workstations`, `Sanctioned-Tools` | Admins and approved tooling legitimately run the same binaries that attackers abuse |
 | **Credential Access** (LSASS, SAM, DPAPI, credential files) | `Service-Accounts`, `Admin-Workstations`, `Sanctioned-Tools`, `Vuln-Scanner-IPs`, `BAS-IPs` | Vulnerability scanners and BAS tools probe credential stores as part of authorized assessments |
 | **Lateral Movement** (PsExec, WMI, SMB, RDP, DCOM) | `Service-Accounts`, `Admin-Workstations`, `Vuln-Scanner-IPs`, `BAS-IPs` | Scanners enumerate SMB/RDP/DCOM; admins use the same tools for remote management |
-| **Cloud** (Azure/AWS/GCP API, sign-in, resource change) | `Service-Accounts`, `VPN-Egress-IPs`, `Vuln-Scanner-IPs`, `BAS-IPs` | Cloud-native assessment tools and automation accounts generate high-volume authorized API calls |
+| **Cloud** (Azure/AWS/GCP API, sign-in, resource change) | `Service-Accounts`, `VPN-Egress-IPs`, `Vuln-Scanner-IPs`, `BAS-IPs`, `Sanctioned-Apps` | Cloud assessment tools and automation accounts generate high-volume authorized API calls; approved cloud-connector apps span many accounts |
 | **PAM / Privileged Access** (secret checkout, session launch, role change) | `Service-Accounts`, `Vuln-Scanner-IPs`, `BAS-IPs` | Password rotation scripts and BAS credential-testing modules interact directly with PAM APIs |
 | **Endpoint / EDR** (file, registry, driver, injection) | `Service-Accounts`, `Admin-Workstations`, `Sanctioned-Tools`, `BAS-IPs` | BAS agents run directly on endpoints and execute the same artifacts as real attackers |
 | **Severity graduation** (all rule types) | `High-Value-Assets` | Always apply — amplifies severity when target is a DC, CA server, or critical asset |
@@ -919,7 +920,7 @@ spl_query: |
 
 ### Watchlist Infrastructure
 
-Before deploying rules to production, create these five watchlists in Sentinel.
+Before deploying rules to production, create these eight watchlists in Sentinel.
 They are referenced by name in every rule template. Without them the watchlist
 joins silently return empty sets and exclusions do not apply.
 
@@ -933,6 +934,7 @@ joins silently return empty sets and exclusions do not apply.
 | `Service-Accounts` | UPN or sAMAccountName | Non-human accounts: service accounts, automation accounts, sync accounts (MSOL_*, AADConnect) | Every identity, sign-in, and process rule |
 | `Admin-Workstations` | Hostname or IP | PAW machines, jump hosts, bastion servers | NTLM, lateral movement, credential access rules |
 | `Sanctioned-Tools` | Process name (lowercase) | Approved security/admin tools: sysinternals, backup agents, RMM executables | Credential access, defense evasion, process rules |
+| `Sanctioned-Apps` | AppDisplayName (lowercase) | Approved applications that legitimately authenticate across many accounts: backup agents (Veeam, Commvault), sync tools (AAD Connect), SIEM connectors, monitoring platforms | Identity, cloud, MFA fatigue rules |
 | `High-Value-Assets` | Hostname or FQDN | Domain controllers, CA servers, PAM servers, crown-jewel app servers | Severity graduation in all rules |
 
 #### Creating a watchlist (once per workspace)
@@ -963,14 +965,17 @@ let ExcludedAdminHosts = toscalar(
     _GetWatchlist('Admin-Workstations') | summarize make_set(SearchKey));
 let SanctionedTools = toscalar(
     _GetWatchlist('Sanctioned-Tools') | summarize make_set(SearchKey));
+let SanctionedApps = toscalar(
+    _GetWatchlist('Sanctioned-Apps') | summarize make_set(tolower(SearchKey)));
 
 // Apply in the query (keep only the lines relevant to this rule's focus):
-| where IPAddress !in (ExcludedVPNIPs)          // network/identity rules
-| where IPAddress !in (ExcludedVulnScanners)    // any rule with a source IP
-| where IPAddress !in (ExcludedBASIPs)          // any rule with a source IP
-| where tolower(UserPrincipalName) !in (ExcludedServiceAccounts)
-| where tolower(DeviceName) !in (ExcludedAdminHosts)
-| where tolower(InitiatingProcessFileName) !in (SanctionedTools)
+| where IPAddress !in (ExcludedVPNIPs)                           // network/identity rules
+| where IPAddress !in (ExcludedVulnScanners)                     // any rule with a source IP
+| where IPAddress !in (ExcludedBASIPs)                           // any rule with a source IP
+| where tolower(UserPrincipalName) !in (ExcludedServiceAccounts) // identity/process rules
+| where tolower(DeviceName) !in (ExcludedAdminHosts)             // endpoint/lateral movement rules
+| where tolower(InitiatingProcessFileName) !in (SanctionedTools) // process execution rules
+| where tolower(AppDisplayName) !in (SanctionedApps)             // identity/cloud/MFA rules
 
 // ── Severity amplifier: high-value asset lookup ───────────────────────────────
 let HighValueAssets = toscalar(
