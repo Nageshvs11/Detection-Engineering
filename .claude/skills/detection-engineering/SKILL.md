@@ -189,13 +189,15 @@ KQL-specific and SPL-specific production requirements.
         (run: <TableName> | summarize max(TimeGenerated) — must return recent data)
 [ ] K3. Rule type declared — // Type: AnalyticRule | HuntingQuery
         New rules default to HuntingQuery unless the technique has zero legitimate use
-[ ] K4. Sentinel Watchlist exclusion blocks present for every applicable FP source:
-        [ ] VPN-Egress-IPs       (any rule that filters on IP address)
-        [ ] Service-Accounts     (any rule that filters on user/account)
-        [ ] Admin-Workstations   (any endpoint or lateral movement rule)
-        [ ] Sanctioned-Tools     (any process creation or execution rule)
-        [ ] High-Value-Assets    (every rule — used for severity graduation)
-        Absent block must be justified with a comment in the rule header
+[ ] K4. Sentinel Watchlist exclusion blocks applied per Exclusion Matrix:
+        [ ] VPN-Egress-IPs       (network, identity, cloud rules — known egress IPs)
+        [ ] Vuln-Scanner-IPs     (any rule with a source IP — scanner traffic is authorized noise)
+        [ ] BAS-IPs              (any rule with a source IP — BAS tools intentionally trigger detections)
+        [ ] Service-Accounts     (identity, process, credential access rules)
+        [ ] Admin-Workstations   (endpoint, lateral movement, credential access rules)
+        [ ] Sanctioned-Tools     (process creation, execution, defense evasion rules)
+        [ ] High-Value-Assets    (every rule — severity graduation)
+        See "Exclusion Application Matrix"; absent block must be justified in the rule header
 [ ] K5. Final output deduplicated — summarize + arg_max before project
         One alert row per entity per time window; never one row per raw event
 [ ] K6. Entity fields projected for Sentinel alert mapping:
@@ -219,13 +221,15 @@ KQL-specific and SPL-specific production requirements.
         to prevent false matches if multiple sourcetypes share an index
 [ ] S3. Rule type declared in header — Type: CorrelationSearch | SavedSearch
         New rules default to SavedSearch unless technique has zero legitimate use
-[ ] S4. Lookup table exclusion checklist ticked in header — for every applicable source:
-        [ ] vpn_egress_ips.csv      (any rule that filters on src_ip or dest_ip)
-        [ ] service_accounts.csv    (any rule that filters on user or account)
-        [ ] admin_workstations.csv  (any endpoint or lateral movement rule)
-        [ ] sanctioned_tools.csv    (any process creation or execution rule)
-        [ ] high_value_assets.csv   (every rule — severity graduation)
-        Absent lookup must be justified in the rule header comment
+[ ] S4. Lookup table exclusion checklist ticked in header per Exclusion Matrix:
+        [ ] vpn_egress_ips.csv       (network, identity, cloud rules — known egress IPs)
+        [ ] vuln_scanner_ips.csv     (any rule with src_ip or dest_ip — scanner traffic is authorized noise)
+        [ ] bas_ips.csv              (any rule with src_ip or dest_ip — BAS tools intentionally trigger detections)
+        [ ] service_accounts.csv     (identity, process, credential access rules)
+        [ ] admin_workstations.csv   (endpoint, lateral movement, credential access rules)
+        [ ] sanctioned_tools.csv     (process creation, execution, defense evasion rules)
+        [ ] high_value_assets.csv    (every rule — severity graduation)
+        See "Exclusion Application Matrix"; absent lookup must be justified in the rule header
 [ ] S5. Final output deduplicated — stats ... by <entity_field> before table
         One notable event per entity per window; never one row per raw event
 [ ] S6. RBA (Risk-Based Alerting) considered for noisy signals
@@ -253,6 +257,58 @@ Before writing any exclusion as a hardcoded value in the query body, ask:
 **Every rule targeting identity, network, cloud, or endpoint data has at least
 one exclusion opportunity. A rule with no exclusion blocks and no justification
 comment is incomplete regardless of whether it passes the other checks.**
+
+---
+
+### Exclusion Application Matrix
+
+Use this table to determine which exclusions to apply before writing the query.
+Every row in the matrix that matches the rule's focus must have a corresponding
+exclusion block — or a documented justification for why it was omitted.
+
+| Rule focus | Required exclusions | Rationale |
+|---|---|---|
+| **Network** (firewall, proxy, DNS, IDS/IPS, traffic logs) | `VPN-Egress-IPs`, `Vuln-Scanner-IPs`, `BAS-IPs` | Scanners and BAS tools generate high-volume authorized traffic that matches network detection patterns |
+| **Identity / Authentication** (sign-in, MFA, SSO, LDAP, Kerberos) | `Service-Accounts`, `VPN-Egress-IPs`, `Vuln-Scanner-IPs`, `BAS-IPs` | Scanner/BAS authentication attempts look identical to credential spray; service accounts legitimately authenticate at high frequency |
+| **Process Execution** (process creation, script execution, command line) | `Service-Accounts`, `Admin-Workstations`, `Sanctioned-Tools` | Admins and approved tooling legitimately run the same binaries that attackers abuse |
+| **Credential Access** (LSASS, SAM, DPAPI, credential files) | `Service-Accounts`, `Admin-Workstations`, `Sanctioned-Tools`, `Vuln-Scanner-IPs`, `BAS-IPs` | Vulnerability scanners and BAS tools probe credential stores as part of authorized assessments |
+| **Lateral Movement** (PsExec, WMI, SMB, RDP, DCOM) | `Service-Accounts`, `Admin-Workstations`, `Vuln-Scanner-IPs`, `BAS-IPs` | Scanners enumerate SMB/RDP/DCOM; admins use the same tools for remote management |
+| **Cloud** (Azure/AWS/GCP API, sign-in, resource change) | `Service-Accounts`, `VPN-Egress-IPs`, `Vuln-Scanner-IPs`, `BAS-IPs` | Cloud-native assessment tools and automation accounts generate high-volume authorized API calls |
+| **PAM / Privileged Access** (secret checkout, session launch, role change) | `Service-Accounts`, `Vuln-Scanner-IPs`, `BAS-IPs` | Password rotation scripts and BAS credential-testing modules interact directly with PAM APIs |
+| **Endpoint / EDR** (file, registry, driver, injection) | `Service-Accounts`, `Admin-Workstations`, `Sanctioned-Tools`, `BAS-IPs` | BAS agents run directly on endpoints and execute the same artifacts as real attackers |
+| **Severity graduation** (all rule types) | `High-Value-Assets` | Always apply — amplifies severity when target is a DC, CA server, or critical asset |
+
+**Decision shortcut:**
+```
+Does the rule have a source IP field (src_ip, IPAddress, ClientIPAddress)?
+  → Always add: VPN-Egress-IPs + Vuln-Scanner-IPs + BAS-IPs
+
+Does the rule have a user/account field?
+  → Always add: Service-Accounts
+
+Does the rule target process execution or endpoint activity?
+  → Always add: Admin-Workstations + Sanctioned-Tools
+
+Does the rule target a host/device field for severity?
+  → Always add: High-Value-Assets (graduation, not exclusion)
+```
+
+**Vuln-Scanner-IPs — what to put in it:**
+IP addresses of all authorized vulnerability scanning infrastructure. Common products:
+Nessus / Tenable.io, Qualys, Rapid7 InsightVM, OpenVAS, Nexpose, Microsoft Defender Vulnerability Management scanners.
+Also include dedicated scan subnets if your scanners rotate through a CIDR range.
+
+**BAS-IPs — what to put in it:**
+IP addresses of Breach and Attack Simulation platform agents and controllers. Common products:
+SafeBreach, AttackIQ, Cymulate, XM Cyber, Picus Security, Mandiant Security Validation.
+Include both the simulation controller IP and the agent IP on each target host if agents initiate outbound traffic.
+
+> **Do not exclude BAS results from AnalyticRules during active simulation exercises.**
+> Instead, suppress by time window or tag the simulation window so alerts are categorized
+> as expected. The BAS exclusion is for *always-on* scanning noise, not for simulation runs
+> where you want to verify the rule fires.
+
+---
 
 ### Platform terminology mapping
 
@@ -556,11 +612,13 @@ Watchlists. Without them, the lookup exclusions silently pass all events through
 
 | CSV filename | Key field | What to put in it | Rules that use it |
 |---|---|---|---|
-| `vpn_egress_ips.csv` | `ip` | VPN gateway exit IPs, ZTNA egress, corporate proxy IPs | Login anomaly, geo-based, network rules |
+| `vpn_egress_ips.csv` | `ip` | VPN gateway exit IPs, ZTNA egress, corporate proxy IPs | Network, login anomaly, geo-based, identity rules |
+| `vuln_scanner_ips.csv` | `ip` | Nessus/Tenable, Qualys, Rapid7, OpenVAS scanner IPs and scan subnets | Any rule with a src_ip or dest_ip field |
+| `bas_ips.csv` | `ip` | SafeBreach, AttackIQ, Cymulate, XM Cyber, Picus agent and controller IPs | Any rule with a src_ip or dest_ip field |
 | `service_accounts.csv` | `account` | Service accounts, automation accounts, sync accounts | Every identity, sign-in, and process rule |
 | `admin_workstations.csv` | `hostname` | PAW machines, jump hosts, bastion servers | Endpoint, lateral movement, credential access rules |
 | `sanctioned_tools.csv` | `process_name` | Approved security/admin tool process names (lowercase) | Process creation, credential access, defense evasion rules |
-| `high_value_assets.csv` | `hostname` | Domain controllers, CA servers, PAM servers, critical app servers | Severity graduation in all endpoint rules |
+| `high_value_assets.csv` | `hostname` | Domain controllers, CA servers, PAM servers, critical app servers | Severity graduation in all rules |
 
 **Minimum CSV structure** (add columns as needed for your environment):
 
@@ -569,6 +627,18 @@ Watchlists. Without them, the lookup exclusions silently pass all events through
 ip,description,last_updated
 203.0.113.10,Corporate VPN gateway EU,2026-05-27
 198.51.100.5,ZTNA egress node US-East,2026-05-27
+
+# vuln_scanner_ips.csv
+ip,scanner_product,description,last_updated
+10.1.100.50,Nessus,Primary Nessus scanner - IT Security,2026-05-27
+10.1.100.51,Qualys,Qualys Cloud Agent scanner IP,2026-05-27
+10.1.100.52,Rapid7,InsightVM scan engine,2026-05-27
+
+# bas_ips.csv
+ip,bas_product,description,last_updated
+10.1.200.10,SafeBreach,SafeBreach controller,2026-05-27
+10.1.200.20,AttackIQ,AttackIQ platform agent,2026-05-27
+10.1.200.30,Cymulate,Cymulate simulation agent,2026-05-27
 
 # service_accounts.csv
 account,description,owner,last_updated
@@ -600,10 +670,16 @@ CASERVER01,Certificate Authority,critical,2026-05-27
 #### Standard SPL lookup exclusion patterns
 
 ```spl
-`comment("── Lookup exclusions — remove blocks that don't apply to this rule ──")`
+`comment("── Lookup exclusions — see Exclusion Matrix; remove blocks that don't apply ──")`
 
-`comment("Exclude known VPN / proxy source IPs (login and network rules)")`
+`comment("Exclude known VPN / proxy source IPs (network and identity rules)")`
 NOT [| inputlookup vpn_egress_ips.csv | rename ip AS src_ip | table src_ip]
+
+`comment("Exclude vulnerability scanner IPs (any rule with a source IP field)")`
+NOT [| inputlookup vuln_scanner_ips.csv | rename ip AS src_ip | table src_ip]
+
+`comment("Exclude Breach & Attack Simulation IPs (any rule with a source IP field)")`
+NOT [| inputlookup bas_ips.csv | rename ip AS src_ip | table src_ip]
 
 `comment("Exclude service / automation accounts (identity and process rules)")`
 NOT [| inputlookup service_accounts.csv | rename account AS user | table user]
@@ -614,7 +690,7 @@ NOT [| inputlookup admin_workstations.csv | rename hostname AS host | table host
 `comment("Exclude sanctioned security / admin tools (process rules)")`
 NOT [| inputlookup sanctioned_tools.csv | rename process_name AS process | table process]
 
-`comment("Severity amplifier — elevate if host is a high-value asset")`
+`comment("Severity amplifier — elevate if host is a high-value asset (all rules)")`
 | lookup high_value_assets.csv hostname AS host OUTPUT criticality AS asset_criticality
 | eval severity = if(asset_criticality="critical" AND severity="high", "critical", severity)
 ```
@@ -702,12 +778,14 @@ Suppress:     <field>:<Xh>  e.g. user:4h
 
 Prerequisite: <forwarder or data connector that must be active>
 
-Lookup exclusions applied:
-  [ ] vpn_egress_ips.csv      (IP-based rules)
-  [ ] service_accounts.csv    (identity and process rules)
-  [ ] admin_workstations.csv  (endpoint and lateral movement rules)
-  [ ] sanctioned_tools.csv    (process creation rules)
-  [ ] high_value_assets.csv   (severity graduation - all rules)
+Lookup exclusions applied (see Exclusion Matrix):
+  [ ] vpn_egress_ips.csv       (network, identity, cloud — known egress IPs)
+  [ ] vuln_scanner_ips.csv     (any rule with a src_ip / dest_ip field)
+  [ ] bas_ips.csv              (any rule with a src_ip / dest_ip field)
+  [ ] service_accounts.csv     (identity, process, credential access rules)
+  [ ] admin_workstations.csv   (endpoint, lateral movement rules)
+  [ ] sanctioned_tools.csv     (process creation, execution rules)
+  [ ] high_value_assets.csv    (every rule — severity graduation)
   Unchecked = not applicable; document why if unexpected.
 
 False positives:
@@ -720,8 +798,12 @@ index="*-<category>" sourcetype=<sourcetype>
     earliest=-1h latest=now
     <field>=<value>
 
-`comment("── Lookup exclusions (delete blocks that do not apply) ────────────")`
+`comment("── Lookup exclusions (see Exclusion Matrix; delete blocks that do not apply) ─")`
 NOT [| inputlookup vpn_egress_ips.csv
+     | rename ip AS src_ip | table src_ip]
+NOT [| inputlookup vuln_scanner_ips.csv
+     | rename ip AS src_ip | table src_ip]
+NOT [| inputlookup bas_ips.csv
      | rename ip AS src_ip | table src_ip]
 NOT [| inputlookup service_accounts.csv
      | rename account AS user | table user]
@@ -798,11 +880,13 @@ joins silently return empty sets and exclusions do not apply.
 
 | Watchlist name | SearchKey field | What to put in it | Used by |
 |---|---|---|---|
-| `VPN-Egress-IPs` | IP address (CIDR or exact) | All VPN gateway exit IPs, ZTNA egress, corporate proxy IPs | Impossible travel, login anomaly, geo-based rules |
-| `Service-Accounts` | UPN or sAMAccountName | Non-human accounts: service accounts, automation accounts, sync accounts (MSOL_*, AADConnect) | Every identity and sign-in rule |
+| `VPN-Egress-IPs` | IP address (CIDR or exact) | All VPN gateway exit IPs, ZTNA egress, corporate proxy IPs | Network, login anomaly, geo-based, identity rules |
+| `Vuln-Scanner-IPs` | IP address (exact or CIDR) | Nessus/Tenable, Qualys, Rapid7 InsightVM, OpenVAS scanner IPs and scan subnets | Any rule with a source IP field |
+| `BAS-IPs` | IP address (exact) | SafeBreach, AttackIQ, Cymulate, XM Cyber, Picus agent and controller IPs | Any rule with a source IP field |
+| `Service-Accounts` | UPN or sAMAccountName | Non-human accounts: service accounts, automation accounts, sync accounts (MSOL_*, AADConnect) | Every identity, sign-in, and process rule |
 | `Admin-Workstations` | Hostname or IP | PAW machines, jump hosts, bastion servers | NTLM, lateral movement, credential access rules |
-| `High-Value-Assets` | Hostname or FQDN | Domain controllers, CA servers, PAM servers, crown-jewel app servers | Severity graduation in endpoint rules |
 | `Sanctioned-Tools` | Process name (lowercase) | Approved security/admin tools: sysinternals, backup agents, RMM executables | Credential access, defense evasion, process rules |
+| `High-Value-Assets` | Hostname or FQDN | Domain controllers, CA servers, PAM servers, crown-jewel app servers | Severity graduation in all rules |
 
 #### Creating a watchlist (once per workspace)
 
@@ -822,6 +906,10 @@ Minimum required columns: `SearchKey` (the value the KQL joins on), `Description
 // ── Exclusion: single-value watchlist (IP, hostname, UPN) ────────────────────
 let ExcludedVPNIPs = toscalar(
     _GetWatchlist('VPN-Egress-IPs') | summarize make_set(SearchKey));
+let ExcludedVulnScanners = toscalar(
+    _GetWatchlist('Vuln-Scanner-IPs') | summarize make_set(SearchKey));
+let ExcludedBASIPs = toscalar(
+    _GetWatchlist('BAS-IPs') | summarize make_set(SearchKey));
 let ExcludedServiceAccounts = toscalar(
     _GetWatchlist('Service-Accounts') | summarize make_set(SearchKey));
 let ExcludedAdminHosts = toscalar(
@@ -829,8 +917,10 @@ let ExcludedAdminHosts = toscalar(
 let SanctionedTools = toscalar(
     _GetWatchlist('Sanctioned-Tools') | summarize make_set(SearchKey));
 
-// Apply in the query:
-| where IPAddress !in (ExcludedVPNIPs)
+// Apply in the query (keep only the lines relevant to this rule's focus):
+| where IPAddress !in (ExcludedVPNIPs)          // network/identity rules
+| where IPAddress !in (ExcludedVulnScanners)    // any rule with a source IP
+| where IPAddress !in (ExcludedBASIPs)          // any rule with a source IP
 | where tolower(UserPrincipalName) !in (ExcludedServiceAccounts)
 | where tolower(DeviceName) !in (ExcludedAdminHosts)
 | where tolower(InitiatingProcessFileName) !in (SanctionedTools)
@@ -965,22 +1055,30 @@ field — blank fields are deployment blockers.
 //
 // Prerequisite: <data connector that must be enabled>
 //
-// Watchlist exclusions applied:
-//   [ ] VPN-Egress-IPs       (IP-based rules)
-//   [ ] Service-Accounts     (identity/sign-in rules)
-//   [ ] Admin-Workstations   (endpoint/lateral movement rules)
-//   [ ] Sanctioned-Tools     (process-based rules)
-//   [ ] High-Value-Assets    (severity graduation)
-//   Unchecked = not applicable for this rule type; document why if unexpected.
+// Watchlist exclusions applied (see Exclusion Matrix):
+//   [ ] VPN-Egress-IPs       (network, identity, cloud — known egress IPs)
+//   [ ] Vuln-Scanner-IPs     (any rule with a source IP)
+//   [ ] BAS-IPs              (any rule with a source IP)
+//   [ ] Service-Accounts     (identity, process, credential access rules)
+//   [ ] Admin-Workstations   (endpoint, lateral movement rules)
+//   [ ] Sanctioned-Tools     (process creation, execution rules)
+//   [ ] High-Value-Assets    (every rule — severity graduation)
+//   Unchecked = not applicable; add a comment explaining why if unexpected.
 //
 // False positives:
 //   - <concrete scenario 1> → mitigated by <watchlist or filter>
 //   - <concrete scenario 2> → mitigated by <watchlist or filter>
 // ============================================================
 
-// ── Watchlist exclusions (remove blocks that don't apply to this rule) ────────
+// ── Watchlist exclusions (keep only blocks relevant to this rule — see Exclusion Matrix) ─
 let ExcludedVPNIPs = toscalar(
     _GetWatchlist('VPN-Egress-IPs')
+    | summarize make_set(SearchKey));
+let ExcludedVulnScanners = toscalar(
+    _GetWatchlist('Vuln-Scanner-IPs')
+    | summarize make_set(SearchKey));
+let ExcludedBASIPs = toscalar(
+    _GetWatchlist('BAS-IPs')
     | summarize make_set(SearchKey));
 let ExcludedServiceAccounts = toscalar(
     _GetWatchlist('Service-Accounts')
@@ -1000,8 +1098,10 @@ let HighValueAssets = toscalar(
 | where TimeGenerated > ago(<Lookback>)   // swap to Timestamp for DefenderXDR target
 // --- core behavior ---
 | where <field> <operator> <value>
-// --- watchlist exclusions ---
-| where IPAddress !in (ExcludedVPNIPs)
+// --- watchlist exclusions (remove lines not applicable to this rule's focus) ---
+| where IPAddress !in (ExcludedVPNIPs)           // network / identity rules
+| where IPAddress !in (ExcludedVulnScanners)     // any rule with a source IP
+| where IPAddress !in (ExcludedBASIPs)           // any rule with a source IP
 | where tolower(UserPrincipalName) !in (ExcludedServiceAccounts)
 | where tolower(DeviceName) !in (ExcludedAdminHosts)
 | where tolower(InitiatingProcessFileName) !in (SanctionedTools)
