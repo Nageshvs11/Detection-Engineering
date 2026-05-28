@@ -39,6 +39,7 @@ All rules are authored as `.yml` files following the Sigma YAML schema. KQL rule
 | `kql/identity/002_mfa_fatigue_adfs_push_bombing.yml` | Identity-DET-Azure-002 | T1621 — MFA Request Generation | Sentinel | High / Critical |
 | `kql/identity/003_password_spray.yml` | Identity-DET-Azure-003 | T1110.003 — Password Spray | Sentinel | High / Critical |
 | `kql/identity/004_attack_chain_credential_access.yml` | Identity-DET-Azure-004 | T1110.003 · T1621 · T1078.004 — Correlated chain | Sentinel | High / Critical |
+| `kql/identity/005_kerberoasting_spn_request.yml` | OS-DET-AD-002 | T1558.003 — Kerberoasting | Sentinel | High / Critical |
 | `kql/windows/001_pass_the_hash_ntlm_lateral_movement.yml` | OS-DET-WIN-001 | T1550.002 — Pass the Hash | Sentinel / Defender XDR | High / Critical |
 | `kql/windows/002_handala_wiper_chain.yml` | OS-DET-WIN-002 | T1485 — Data Destruction | Sentinel / Defender XDR | Critical |
 | `kql/cloud/001_impossible_travel_login.yml` | Cloud-DET-Azure-001 | T1078.004 — Cloud Accounts | Sentinel | High / Critical |

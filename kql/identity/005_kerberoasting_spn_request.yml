@@ -1,0 +1,447 @@
+title: Kerberoasting — TGS Request for User-Account SPN
+id: f6a7b8c9-d0e1-2345-f012-3456789abcde
+status: stable
+description: |
+    Detects Kerberoasting — the offline password cracking attack where an attacker
+    requests Kerberos Service Tickets (TGS) for Service Principal Names registered
+    to user accounts, then cracks the RC4 or AES hash offline.
+
+    Methodology applied (see SKILL.md Detection Methodology):
+
+    Q1 — Must do: request TGS for a user-account SPN via Kerberos.
+         Generates EID 4769 on every DC that processes the request. Unavoidable.
+
+    Q2 — Can evade:
+         (a) Request AES-256 (0x12) instead of RC4 (0x17) — Rubeus --enctype aes256
+         (b) Target only one SPN per session — no sweep volume signal
+         (c) Slow-rate roast — one SPN per day over weeks
+         (d) Disable "Audit Kerberos Service Ticket Operations" on DCs (requires DA)
+
+    Q3 — Survives evasion: EID 4769 WHERE ServiceName is a user account (not ending "$").
+         Workstations legitimately request TGS for machine-account SPNs (HTTP/server$,
+         CIFS/server$). Requesting TGS for user-account SPNs from a workstation has
+         no routine legitimate cause — the signal holds regardless of encryption type or rate.
+
+    Signal tiers:
+      Branch A (RC4RoastRequest): T2 (EID 4769, user SPN) + T4 (RC4 enc type 0x17)
+      Branch B (SPNSweep):        T2 (EID 4769, user SPN) + T3 (≥3 distinct SPNs)
+
+    Documented evasion gap: slow-rate roasting (1 SPN/day) bypasses both branches.
+    Companion HuntingQuery (30d lookback) covers this — see companion_hunting note.
+author: Detection KB
+date: 2026-05-28
+modified: 2026-05-28
+
+tags:
+    - attack.credential_access
+    - attack.t1558.003
+
+logsource:
+    product: windows
+    service: security
+    definition: Requires "Audit Kerberos Service Ticket Operations" — Success — enabled
+                under Computer Configuration → Windows Settings → Security Settings →
+                Advanced Audit Policy → Account Logon → Kerberos Service Ticket Operations.
+                Must be applied via GPO to all Domain Controllers.
+
+detection:
+    selection:
+        EventID: 4769
+    filter_machine_accounts:
+        TargetUserName|endswith: '$'
+    filter_krbtgt:
+        TargetUserName: 'krbtgt'
+    condition: selection and not filter_machine_accounts and not filter_krbtgt
+
+platform: sentinel
+rule_type: AnalyticRule
+use_case_id: OS-DET-AD-002_kerberoasting_spn_request
+schedule: 15m
+lookback: 1h
+suppress: SubjectUserName:2h
+
+companion_hunting: |
+    Slow-rate Kerberoasting (1 SPN/day over weeks) bypasses the 1h lookback.
+    Run the following query periodically against a 30d window as a HuntingQuery:
+      SecurityEvent
+      | where TimeGenerated > ago(30d)
+      | where EventID == 4769
+      | extend ServiceName = TargetUserName
+      | where ServiceName !endswith "$" and ServiceName !in~ ("krbtgt", "")
+      | summarize DailyRequests=count(), SPNs=make_set(ServiceName, 50)
+            by bin(TimeGenerated, 1d), SubjectUserName, IpAddress
+      | where array_length(SPNs) >= 1
+      | summarize TotalDays=dcount(bin(TimeGenerated, 1d)), AllSPNs=make_set_if(
+            tostring(SPNs), true, 200) by SubjectUserName, IpAddress
+      | where TotalDays >= 3   // same account/IP requesting user SPNs on 3+ distinct days
+
+prerequisites:
+    - Audit Kerberos Service Ticket Operations — Success — enabled on all DCs via GPO
+      (Computer Config → Windows Settings → Security Settings → Advanced Audit Policy →
+      Account Logon → Kerberos Service Ticket Operations)
+    - Windows Security Event log forwarded to Sentinel via AMA or MMA agent
+
+watchlists:
+    - VPN-Egress-IPs
+    - Vuln-Scanner-IPs
+    - BAS-IPs
+    - Service-Accounts
+    - Admin-Workstations
+    - High-Value-Assets
+
+falsepositives:
+    - Applications that directly use Kerberos APIs and hold their own TGTs may request
+      SPNs for user-account-based services (e.g., Java Kerberos apps, SAP, Oracle)
+      — add these service accounts to Service-Accounts watchlist as requesters, OR
+      add their source IPs to Admin-Workstations if they run on known application servers
+    - Privileged Access Workstations (PAWs) connecting to services running under user
+      accounts (SQL Server, IIS with domain-user identity) — filtered by Admin-Workstations
+    - Vulnerability scanners probing Kerberos — filtered by Vuln-Scanner-IPs
+    - BAS platforms executing Kerberoasting simulations — filtered by BAS-IPs
+    - AES Kerberoasting (--enctype aes256) from a single SPN does not trigger Branch A
+      and may not trigger Branch B below the 3-SPN threshold — documented evasion gap
+
+# RC4 request for user SPN has no legitimate modern use; SPN sweep from workstation
+# is almost never authorized — both branches carry low FP risk with correct exclusions
+level: high
+
+kql_query: |
+    // ── Methodology: Phase 0 applied ─────────────────────────────────────────────
+    // Q1 (must do): request TGS for user-account SPN → EID 4769 on DC (T2 signal)
+    // Q2 (can evade): use AES enc type, target 1 SPN, slow rate, disable audit policy
+    // Q3 (evasion-resistant): user-account SPN request from workstation — anchored on
+    //   ServiceName not ending "$" which holds regardless of tool, enc type, or rate
+
+    // ── Watchlist exclusions ──────────────────────────────────────────────────────
+    let ExcludedVPNIPs = toscalar(
+        _GetWatchlist('VPN-Egress-IPs') | summarize make_set(SearchKey));
+    let ExcludedScannerIPs = toscalar(
+        _GetWatchlist('Vuln-Scanner-IPs') | summarize make_set(SearchKey));
+    let ExcludedBASIPs = toscalar(
+        _GetWatchlist('BAS-IPs') | summarize make_set(SearchKey));
+    let ExcludedServiceAccounts = toscalar(
+        _GetWatchlist('Service-Accounts') | summarize make_set(tolower(SearchKey)));
+    let ExcludedAdminHosts = toscalar(
+        _GetWatchlist('Admin-Workstations') | summarize make_set(tolower(SearchKey)));
+    let HighValueAssets = toscalar(
+        _GetWatchlist('High-Value-Assets') | summarize make_set(tolower(SearchKey)));
+
+    // ── Base dataset: EID 4769 — user-account SPN requests ───────────────────────
+    // EID 4769 fires on the DC for every TGS request. We filter to user-account SPNs
+    // (ServiceName not ending "$") which are the Kerberoasting target class.
+    // Machine-account SPNs (HTTP/server$, CIFS/server$, MSSQLSvc/server$) are
+    // the normal service-access case and are excluded.
+    //
+    // Field mapping in Sentinel SecurityEvent for EID 4769:
+    //   TargetUserName   = ServiceName in the event XML (the SPN's owning account)
+    //   SubjectUserName  = the account requesting the ticket (attacker's account)
+    //   IpAddress        = client address (may be ::ffff:x.x.x.x for IPv4)
+    //   TicketEncryptionType = in EventData XML; parsed via extract()
+    //   Computer         = the DC logging the event
+    let KerbTicketRequests = materialize(
+        SecurityEvent
+        | where TimeGenerated > ago(1h)
+        | where EventID == 4769
+        // Parse ticket encryption type and status from EventData XML
+        | extend
+            EncType       = extract(@'TicketEncryptionType[^>]*>(0x[0-9a-f]+)<', 1, EventData),
+            RequestStatus = extract(@'<Data Name="Status">(0x[0-9a-f]+)<', 1, EventData)
+        // Filter to successful requests only (Status 0x0)
+        | where RequestStatus == "0x0" or isempty(RequestStatus)
+        // Core signal: user-account SPN (T2 — cannot request without generating this event)
+        | where TargetUserName !endswith "$"         // exclude machine-account SPNs
+        | where TargetUserName !in~ ("krbtgt", "")   // exclude TGT renewal and blanks
+        // Normalize IPv4-mapped IPv6 addresses (::ffff:10.0.0.1 → 10.0.0.1)
+        | extend ClientIPNorm = iif(IpAddress startswith "::ffff:",
+                                    substring(IpAddress, 7), IpAddress)
+        | where ClientIPNorm !in ("127.0.0.1", "::1", "")
+        // --- watchlist exclusions ---
+        | where ClientIPNorm !in (ExcludedVPNIPs)
+        | where ClientIPNorm !in (ExcludedScannerIPs)
+        | where ClientIPNorm !in (ExcludedBASIPs)
+        | where tolower(SubjectUserName) !in (ExcludedServiceAccounts)
+        | where tolower(Computer) !in (ExcludedAdminHosts)
+        // --- encryption type label ---
+        | extend EncryptionLabel = case(
+            EncType == "0x17", "RC4-HMAC",
+            EncType == "0x12", "AES256",
+            EncType == "0x11", "AES128",
+            EncType == "0x1",  "DES-CBC-CRC",
+            isempty(EncType),  "Unknown",
+            strcat("Other(", EncType, ")")
+        )
+        | project
+            TimeGenerated,
+            ServiceName       = TargetUserName,     // user-account SPN target
+            RequesterAccount  = tolower(SubjectUserName),
+            RequesterDomain   = SubjectDomainName,
+            ClientIPNorm,
+            EncType,
+            EncryptionLabel,
+            Computer                                // DC name
+    );
+
+    // ── Branch A: RC4RoastRequest — tool-default encryption fingerprint ──────────
+    // Kerberoasting tools (Rubeus, Impacket GetUserSPNs.py, Mimikatz kerberos::ask)
+    // default to requesting RC4 (0x17) because RC4 TGS hashes crack orders of
+    // magnitude faster offline than AES.
+    //
+    // Signal tier: T4 (tool-specific) + T2 (unavoidable EID 4769)
+    // Modern Windows clients and applications request AES by default. An RC4 request
+    // for a user-account SPN from a workstation has no routine legitimate explanation.
+    //
+    // Evasion: attacker uses --enctype aes256 → moves to Branch B.
+    // This is an intentional design gap — Branch B + companion HuntingQuery close it.
+    let RoastAttempt = KerbTicketRequests
+    | where EncType == "0x17"       // RC4: primary Kerberoasting tool fingerprint
+    | summarize
+        RequestCount    = count(),
+        TargetedSPNs    = make_set(ServiceName, 30),
+        SPNCount        = dcount(ServiceName),
+        RequestTimes    = make_set(TimeGenerated, 10),
+        DCs             = make_set(Computer, 5),
+        FirstRequest    = min(TimeGenerated),
+        LastRequest     = max(TimeGenerated)
+        by RequesterAccount, RequesterDomain, ClientIPNorm
+    | extend
+        DetectionBranch = "RC4RoastRequest",
+        SignalTier      = "T4+T2: RC4 encryption requested for user-account SPN — tool default indicator",
+        // Multiple SPNs via RC4 = near-certain mass Kerberoasting in progress
+        Severity = case(
+            SPNCount >= 5,  "Critical",
+            SPNCount >= 2,  "High",
+            "High"          // even 1 RC4 user-SPN request is High from a workstation
+        )
+    | project
+        DetectionBranch, SignalTier, Severity,
+        RequesterAccount, RequesterDomain, ClientIPNorm,
+        RequestCount, SPNCount, TargetedSPNs,
+        RequestTimes, DCs, FirstRequest, LastRequest;
+
+    // ── Branch B: SPNSweep — multiple user-account SPN requests (any enc type) ───
+    // A Kerberoasting tool first enumerates all SPNs registered to user accounts
+    // (via LDAP), then requests TGS for each. Three or more distinct user-account
+    // SPN requests from one source in the window is the behavioral fingerprint.
+    //
+    // Signal tier: T3+T2: behavioral pattern + unavoidable EID 4769
+    // This branch catches AES Kerberoasting that evades Branch A, and any tool that
+    // sweeps SPNs regardless of encryption preference.
+    //
+    // Evasion: 1–2 SPNs per session below the 3-SPN threshold.
+    // Mitigated by companion HuntingQuery with 30d lookback.
+    let SweepRoast = KerbTicketRequests
+    | summarize
+        RequestCount    = count(),
+        SPNCount        = dcount(ServiceName),
+        TargetedSPNs    = make_set(ServiceName, 30),
+        EncTypes        = make_set(EncryptionLabel, 5),
+        DCs             = make_set(Computer, 5),
+        FirstRequest    = min(TimeGenerated),
+        LastRequest     = max(TimeGenerated)
+        by RequesterAccount, RequesterDomain, ClientIPNorm
+    | where SPNCount >= 3       // 3+ distinct user-account SPNs = SPN enumeration sweep
+    | extend
+        DetectionBranch = "SPNSweep",
+        SignalTier      = "T3+T2: ≥3 distinct user-account SPN requests — enumeration sweep pattern",
+        Severity = case(
+            SPNCount >= 10, "Critical",
+            SPNCount >= 5,  "High",
+            "Medium"
+        )
+    | project
+        DetectionBranch, SignalTier, Severity,
+        RequesterAccount, RequesterDomain, ClientIPNorm,
+        RequestCount, SPNCount, TargetedSPNs,
+        EncTypes, DCs, FirstRequest, LastRequest;
+
+    // ── Union branches, deduplicate, enrich ──────────────────────────────────────
+    RoastAttempt
+    | union SweepRoast
+    // Deduplicate: same account+IP may appear in both branches; keep highest severity
+    | extend SeverityOrder = case(
+        Severity == "Critical", 3,
+        Severity == "High",     2,
+        Severity == "Medium",   1, 0)
+    | summarize arg_max(SeverityOrder, *) by RequesterAccount, ClientIPNorm
+    // ── Severity amplifier: high-value SPN targeted ───────────────────────────────
+    // If any targeted SPN belongs to an account on the High-Value-Assets watchlist
+    // (DCs, CA servers, PAM), escalate unconditionally — credential compromise of
+    // these accounts is a full domain/infrastructure compromise scenario.
+    | extend
+        HVATargeted = array_length(set_intersect(TargetedSPNs, HighValueAssets)) > 0
+    | extend
+        Severity      = iff(HVATargeted, "Critical", Severity),
+        SeverityOrder = iff(HVATargeted, 3, SeverityOrder)
+    // ── Enrich requester account context via IdentityInfo ─────────────────────────
+    | join kind=leftouter (
+        IdentityInfo
+        | where TimeGenerated > ago(7d)
+        | summarize arg_max(TimeGenerated, *) by AccountUPN
+        | project
+            AccountUPN,
+            DisplayName    = AccountDisplayName,
+            JobTitle,
+            Department,
+            AssignedRoles,
+            IsAccountEnabled
+    ) on $left.RequesterAccount == $right.AccountUPN
+    | extend
+        IsPrivilegedRequester = AssignedRoles has_any (
+            "Global Administrator", "Privileged Role Administrator",
+            "Security Administrator", "Domain Admins", "Enterprise Admins"
+        )
+    // Compromised privileged account performing Kerberoasting = immediate escalation
+    | extend Severity = iff(IsPrivilegedRequester and Severity != "Critical",
+                            "Critical", Severity)
+    // ── Rule metadata ─────────────────────────────────────────────────────────────
+    | extend
+        ATT_CK  = "T1558.003",
+        RuleID  = "OS-DET-AD-002_kerberoasting_spn_request",
+        EvasionGaps = strcat(
+            "Documented gaps: ",
+            "(1) AES-only single-SPN roasting bypasses both branches — ",
+            "run companion HuntingQuery (30d) to catch slow-rate patterns. ",
+            "(2) Detection is blind if DC audit policy 'Kerberos Service Ticket Operations' ",
+            "is disabled (requires Domain Admin to change). ",
+            "(3) Legitimate Java/SAP apps may generate Branch B hits — ",
+            "add their source IPs to Admin-Workstations watchlist."
+        ),
+        Triage  = strcat(
+            "Branch: ", DetectionBranch, " | Requester: ", RequesterAccount,
+            " from ", ClientIPNorm, " | ", SPNCount, " SPN(s) targeted: ",
+            tostring(TargetedSPNs), ". ",
+            "1. Confirm ", ClientIPNorm,
+            " is a known workstation or application server — check DHCP/DNS/asset inventory. ",
+            "2. If RC4 branch (RC4RoastRequest): no modern app requests RC4 for user SPNs. ",
+            "Treat as confirmed Kerberoasting. Skip further triage — go directly to response. ",
+            "3. Response: rotate the password for every SPN in TargetedSPNs immediately. ",
+            "Use a long random password (25+ chars) — the existing hash is likely compromised. ",
+            "4. If HVATargeted=true: treat as domain-level breach scenario. ",
+            "All targeted service accounts must be assumed compromised. ",
+            "5. Search DeviceProcessEvents or SecurityEvent on the source host for ",
+            "Rubeus.exe, GetUserSPNs.py, Invoke-Kerberoast, or PowerSploit indicators. ",
+            "6. Check if Defender for Identity generated a Kerberoasting alert — ",
+            "correlate the DFI alert GUID for additional context."
+        )
+    | extend
+        AccountName   = tostring(split(RequesterAccount, "@")[0]),
+        AccountDomain = coalesce(RequesterDomain, tostring(split(RequesterAccount, "@")[1]))
+    // ── Output ────────────────────────────────────────────────────────────────────
+    | project-reorder
+        Severity,
+        DetectionBranch,
+        SignalTier,
+        RequesterAccount,
+        AccountName,
+        AccountDomain,
+        DisplayName,
+        JobTitle,
+        Department,
+        ClientIPNorm,
+        SPNCount,
+        TargetedSPNs,
+        RequestCount,
+        HVATargeted,
+        IsPrivilegedRequester,
+        IsAccountEnabled,
+        AssignedRoles,
+        DCs,
+        FirstRequest,
+        LastRequest,
+        ATT_CK,
+        RuleID,
+        EvasionGaps,
+        Triage
+    | sort by Severity asc, SPNCount desc
+
+tests:
+    - name: RC4 Kerberoasting — Rubeus default (RC4RoastRequest branch, High)
+      log_source:
+          product: windows
+          service: security
+      event:
+          EventID: 4769
+          TargetUserName: svcSQL        # user-account SPN, no trailing $
+          SubjectUserName: john.doe
+          IpAddress: "::ffff:10.0.5.42"
+          EncType: "0x17"               # RC4 — tool default
+          Status: "0x0"
+      expected: match
+
+    - name: AES Kerberoasting sweep — 5 SPNs (SPNSweep branch, High)
+      log_source:
+          product: windows
+          service: security
+      event:
+          EventID: 4769
+          TargetUserName: svcBackup     # one of 5 distinct user-account SPNs
+          SubjectUserName: compromised.user
+          IpAddress: "10.0.5.42"
+          EncType: "0x12"               # AES256 — evades Branch A, caught by Branch B
+          Status: "0x0"
+          DistinctSPNCount: 5
+      expected: match
+
+    - name: High-value SPN targeted — Critical escalation
+      log_source:
+          product: windows
+          service: security
+      event:
+          EventID: 4769
+          TargetUserName: svcPAM        # in High-Value-Assets watchlist
+          SubjectUserName: alice
+          IpAddress: "10.0.5.99"
+          EncType: "0x17"
+          Status: "0x0"
+      expected: match
+
+    - name: Machine account SPN — should NOT fire (legitimate service access)
+      log_source:
+          product: windows
+          service: security
+      event:
+          EventID: 4769
+          TargetUserName: "FILESERVER01$"    # machine account — ends with $
+          SubjectUserName: bob.smith
+          IpAddress: "10.0.1.10"
+          EncType: "0x12"
+          Status: "0x0"
+      expected: no_match
+
+    - name: krbtgt renewal — should NOT fire
+      log_source:
+          product: windows
+          service: security
+      event:
+          EventID: 4769
+          TargetUserName: krbtgt
+          SubjectUserName: dc01
+          IpAddress: "10.0.0.5"
+          Status: "0x0"
+      expected: no_match
+
+    - name: Vulnerability scanner — should NOT fire (IP in Vuln-Scanner-IPs)
+      log_source:
+          product: windows
+          service: security
+      event:
+          EventID: 4769
+          TargetUserName: svcIIS
+          SubjectUserName: scanner.account
+          IpAddress: "10.0.1.200"      # in Vuln-Scanner-IPs watchlist
+          EncType: "0x17"
+          Status: "0x0"
+      expected: no_match
+
+    - name: Admin workstation accessing SQL service account — should NOT fire
+      log_source:
+          product: windows
+          service: security
+      event:
+          EventID: 4769
+          TargetUserName: svcSQL
+          SubjectUserName: admin.user
+          IpAddress: "10.0.10.5"       # source host in Admin-Workstations watchlist
+          EncType: "0x12"
+          Status: "0x0"
+      expected: no_match
