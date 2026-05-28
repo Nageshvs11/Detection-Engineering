@@ -384,6 +384,24 @@ as a human-readable summary of the logic.
 
 ### Root paths
 
+All rule files are written to `/opt/DetectionEngineering/`. Never write rules
+directly into the `mcp-detection-kb` project tree — that directory is the MCP
+server and knowledge-base repo, not the rule store.
+
+| Format | Root path |
+|--------|-----------|
+| KQL (Microsoft Sentinel / Defender XDR) | `/opt/DetectionEngineering/kql/` |
+| SPL (Splunk) | `/opt/DetectionEngineering/splunk/` |
+
+**Example absolute paths:**
+```
+/opt/DetectionEngineering/kql/identity/003_password_spray.yml
+/opt/DetectionEngineering/kql/windows/002_handala_wiper_chain.yml
+/opt/DetectionEngineering/splunk/identity/001_kerberoasting_spn_enum.yml
+```
+
+---
+
 ### KQL table selection — data source → Sentinel table
 
 Before writing any KQL rule, identify the data source and select the correct
@@ -558,11 +576,11 @@ sequence number, followed by an underscore and a lowercase descriptive name.
 
 **Examples:**
 ```
-kql/windows/001_lsass_minidump_api.yml
-kql/windows/002_handala_wiper_chain.yml
-splunk/identity/001_kerberoasting_spn_enum.yml
-splunk/web/001_apache_log4j_exploit.yml
-rules/proc_creation_win_hktl_mimikatz_command_line.yml
+/opt/DetectionEngineering/kql/windows/001_lsass_minidump_api.yml
+/opt/DetectionEngineering/kql/windows/002_handala_wiper_chain.yml
+/opt/DetectionEngineering/splunk/identity/001_kerberoasting_spn_enum.yml
+/opt/DetectionEngineering/splunk/web/001_apache_log4j_exploit.yml
+rules/proc_creation_win_hktl_mimikatz_command_line.yml   # Sigma only — stays in mcp-detection-kb/rules/
 ```
 
 ### Determining the next sequence number
@@ -571,11 +589,11 @@ Before writing a new rule file, run:
 
 ```bash
 python .claude/skills/detection-engineering/scripts/next-seq.py \
-    kql/windows
+    /opt/DetectionEngineering/kql/windows
 # → 003   (if 001 and 002 already exist)
 ```
 
-Then name the file `{result}_{description}.yml`.
+Then write the file to `/opt/DetectionEngineering/kql/<category>/{result}_{description}.yml`.
 
 **Never reuse or skip sequence numbers.** If a rule file is deleted, the gap
 remains — do not renumber existing files.
