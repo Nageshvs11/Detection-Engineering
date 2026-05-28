@@ -65,11 +65,23 @@ Detection-Engineering/
 Each KQL rule follows a standard structure:
 
 - **Dual console support** — rules declare `// Target: Sentinel`, `// Target: DefenderXDR`, or `// Target: Both` and use the correct timestamp field (`TimeGenerated` vs `Timestamp`)
-- **Watchlist exclusions** — five standard Sentinel Watchlists (`VPN-Egress-IPs`, `Service-Accounts`, `Admin-Workstations`, `Sanctioned-Tools`, `High-Value-Assets`) are applied for FP suppression
+- **Context-aware watchlist exclusions** — seven standard Sentinel Watchlists applied based on the rule's focus area (see Exclusion Matrix below)
 - **Severity graduation** — alerts escalate to `Critical` when the targeted account or asset appears in `High-Value-Assets`
 - **Rule type** — every rule declares `AnalyticRule` (auto-creates incident) or `HuntingQuery` (analyst-reviewed) in the header
 - **Deduplication** — `summarize + arg_max(TimeGenerated, *)` ensures one row per entity per alert window
 - **Triage guidance** — every rule includes a `Triage` field with step-by-step analyst instructions
+
+### Sentinel Watchlists
+
+| Watchlist | Purpose | Rules that use it |
+|---|---|---|
+| `VPN-Egress-IPs` | Corporate VPN gateway and ZTNA egress IPs | Network, identity, cloud rules |
+| `Vuln-Scanner-IPs` | Nessus, Qualys, Rapid7, OpenVAS scanner IPs | Any rule with a source IP field |
+| `BAS-IPs` | SafeBreach, AttackIQ, Cymulate, XM Cyber agent and controller IPs | Any rule with a source IP field |
+| `Service-Accounts` | Non-human accounts — service, automation, sync accounts | Every identity, sign-in, and process rule |
+| `Admin-Workstations` | PAW machines, jump hosts, bastion servers | Endpoint, lateral movement, credential access rules |
+| `Sanctioned-Tools` | Approved security and admin tool process names | Process creation, execution, defense evasion rules |
+| `High-Value-Assets` | Domain controllers, CA servers, PAM servers, crown-jewel assets | All rules — severity graduation |
 
 ---
 
@@ -78,9 +90,44 @@ Each KQL rule follows a standard structure:
 SPL rules (added to `splunk/` as they are written) follow the same principles adapted for Splunk ES:
 
 - **Index routing** — rules target the correct index pattern (`*-os-win`, `*-os-linux`, `*-network`, `*-edr`, `*-azure`, `*-pam`, etc.)
-- **Lookup exclusions** — five standard lookup CSVs mirror the Sentinel Watchlists (`vpn_egress_ips.csv`, `service_accounts.csv`, `admin_workstations.csv`, `sanctioned_tools.csv`, `high_value_assets.csv`)
+- **Context-aware lookup exclusions** — seven standard lookup CSVs mirror the Sentinel Watchlists and are applied based on the rule's focus area (see Exclusion Matrix below)
 - **Rule type** — `CorrelationSearch` (creates notable event) or `SavedSearch` (analyst-reviewed report)
 - **RBA support** — high-volume signals use the Risk-Based Alerting pattern (`risk_object`, `risk_score`, `risk_index`) instead of direct notable events
+
+### Splunk Lookup CSVs
+
+| CSV file | Purpose | Rules that use it |
+|---|---|---|
+| `vpn_egress_ips.csv` | Corporate VPN gateway and ZTNA egress IPs | Network, identity, cloud rules |
+| `vuln_scanner_ips.csv` | Nessus, Qualys, Rapid7, OpenVAS scanner IPs | Any rule with a `src_ip` or `dest_ip` field |
+| `bas_ips.csv` | SafeBreach, AttackIQ, Cymulate, XM Cyber agent and controller IPs | Any rule with a `src_ip` or `dest_ip` field |
+| `service_accounts.csv` | Non-human accounts — service, automation, sync accounts | Every identity, sign-in, and process rule |
+| `admin_workstations.csv` | PAW machines, jump hosts, bastion servers | Endpoint, lateral movement, credential access rules |
+| `sanctioned_tools.csv` | Approved security and admin tool process names | Process creation, execution, defense evasion rules |
+| `high_value_assets.csv` | Domain controllers, CA servers, PAM servers, crown-jewel assets | All rules — severity graduation |
+
+---
+
+## Exclusion Matrix
+
+Every rule applies exclusions based on its focus area. The matrix below determines which watchlists and lookup CSVs are required for each rule type.
+
+| Rule focus | Required exclusions | Why |
+|---|---|---|
+| **Network** (firewall, proxy, DNS, IDS/IPS) | VPN IPs · Scanner IPs · BAS IPs | Scanners and BAS tools generate high-volume authorized traffic that matches network detection patterns |
+| **Identity / Authentication** (sign-in, MFA, LDAP, Kerberos) | Service accounts · VPN IPs · Scanner IPs · BAS IPs | Scanner/BAS auth attempts look identical to credential spray; service accounts authenticate at high frequency |
+| **Process Execution** (process creation, script execution) | Service accounts · Admin workstations · Sanctioned tools | Admins and approved tooling run the same binaries attackers abuse |
+| **Credential Access** (LSASS, SAM, DPAPI) | Service accounts · Admin workstations · Sanctioned tools · Scanner IPs · BAS IPs | Scanners and BAS tools probe credential stores as part of authorized assessments |
+| **Lateral Movement** (PsExec, WMI, SMB, RDP) | Service accounts · Admin workstations · Scanner IPs · BAS IPs | Scanners enumerate SMB/RDP; admins use the same remote management tools |
+| **Cloud** (Azure/AWS/GCP API, resource change) | Service accounts · VPN IPs · Scanner IPs · BAS IPs | Cloud assessment tools and automation accounts generate high-volume authorized API calls |
+| **Endpoint / EDR** (file, registry, injection) | Service accounts · Admin workstations · Sanctioned tools · BAS IPs | BAS agents run directly on endpoints and execute the same artifacts as real attackers |
+| **PAM / Privileged Access** | Service accounts · Scanner IPs · BAS IPs | Password rotation scripts and BAS credential-testing modules interact directly with PAM APIs |
+| **All rules** | High-Value-Assets | Severity graduation — always applied, never used as exclusion |
+
+**Quick decision rule:**
+- Rule has a source IP field → always add VPN + scanner + BAS IPs
+- Rule has a user/account field → always add service accounts
+- Rule targets process execution or endpoint activity → always add admin workstations + sanctioned tools
 
 ---
 
