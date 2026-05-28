@@ -2477,7 +2477,10 @@
     "tactics": [
       "credential-access"
     ],
-    "url": "https://attack.mitre.org/techniques/T1110/003"
+    "url": "https://attack.mitre.org/techniques/T1110/003",
+    "rules": [
+      "Identity-DET-Azure-003_password_spray"
+    ]
   },
   "T1090.002": {
     "name": "External Proxy",
