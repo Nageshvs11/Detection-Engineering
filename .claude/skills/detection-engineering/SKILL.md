@@ -17,6 +17,327 @@ Use this skill when:
 - Asked to validate, check, or audit detection rules
 - Converting detections between formats (Sigma to KQL, SPL, etc.)
 
+---
+
+## Detection Methodology
+
+Before writing any query, work through the methodology below. Rules written without
+this thinking protect against known-good lab samples. Rules written with it protect
+against adversary goals — which remain constant even when tools and infrastructure change.
+
+---
+
+### Core Principle: Offense Informs Defense
+
+A detection written purely from a defender's perspective identifies artifacts of
+known attacks. A detection written from an attacker's perspective identifies
+**unavoidable behaviors** — what the adversary *must* do regardless of which tool,
+IP, or account they use.
+
+The difference: when an attacker adapts, defender-perspective rules break. Offense-
+perspective rules survive because they are anchored to behavior that cannot be removed
+without abandoning the technique entirely.
+
+---
+
+### Phase 0: Three Questions Before Writing Any Rule
+
+Answer all three before opening a query editor. If you cannot answer Q3, the rule
+will be evadable and you should document that explicitly.
+
+```
+Q1 — What must the attacker do?
+     The behavior that is unavoidable given the technique.
+     Example (DCSync): a non-DC account must call DRSUAPI GetNCChanges.
+     The attacker cannot perform DCSync without triggering this — it is the technique.
+
+Q2 — What might they change to evade this specific detection?
+     Which fields, thresholds, or time windows can they tune?
+     Example (spray): they can reduce accounts-per-IP, slow the rate,
+     rotate source IPs, or use legacy auth to avoid MFA challenge events.
+
+Q3 — What artifact survives all reasonable evasion?
+     The signal that remains true regardless of tool, speed, or IP.
+     Example (spray): ResultType=50126 from ANY IP against ANY account is a
+     wrong-password event. Volume signals can be evaded; the event code cannot.
+     Build the core detection on Q3. Enrich and graduate severity with Q1/Q2.
+```
+
+If Q3 has no answer — the behavior is entirely optional or log sources can be
+disabled — document this as a **detection gap** and write a hunting query instead
+of a production analytic rule.
+
+---
+
+### Signal Quality Hierarchy
+
+Rank every signal you consider before using it as a detection anchor.
+Build rules on the highest tier achievable. Document the tier in the rule header.
+
+| Tier | Signal type | Evasion resistance | Example |
+|------|-------------|-------------------|---------|
+| **T1** | Unavoidable protocol / OS artifact | Very high — changing it breaks the technique | `ActionType=DirectoryServicesReplication` for DCSync |
+| **T2** | Unavoidable log event (cannot be suppressed without disabling logging entirely) | High — attacker must disable audit policy | EID 4662 on `msDS-Replication-*` rights |
+| **T3** | Behavioral pattern (combination of events that is highly unusual) | Medium — attacker can slow or distribute | 1 IP × many accounts × few attempts = spray pattern |
+| **T4** | Tool-specific indicator (named pipe, mutex, PDB string) | Medium-low — attacker can recompile or rename | Mimikatz default named pipe `\pipe\lsass` |
+| **T5** | Volume / frequency threshold | Low — attacker stays one step below your threshold | >10 failures in 1h |
+| **T6** | IOC (IP, hash, domain) | Very low — changes with every campaign | Known C2 IP |
+
+**Rules:**
+- A Tier 5 or Tier 6 rule in isolation is noise management, not threat detection.
+  Always pair them with a higher-tier signal or a longitudinal variant.
+- A Tier 1–2 rule with good exclusions is the goal. Write for that anchor even if
+  enrichment or severity graduation uses lower-tier signals.
+- Never build severity graduation on a Tier 6 signal (IOC match ≠ confirmed attack;
+  it confirms a tool, not a technique).
+
+---
+
+### Evasion Modeling
+
+For every rule, explicitly work through the evasion matrix before finalizing the
+detection logic. Record findings in the rule's `falsepositives` or as an inline
+comment — future engineers need to know what this rule does and does not catch.
+
+```
+Threshold bypass:
+  What value keeps the attacker below your alert threshold?
+  → Lower the threshold OR add a longitudinal companion query.
+
+Time window bypass:
+  How long does the attacker wait between events to avoid the rolling window?
+  → Consider a longer lookback for a HuntingQuery variant of the same rule.
+
+Field substitution:
+  Which query fields can the attacker control or falsify?
+  → Anchor on fields the OS or protocol populates, not fields the attacker supplies.
+
+Log source bypass:
+  Which audit policy, diagnostic setting, or connector must be ON for this rule to fire?
+  → Document it in `prerequisites:`. Consider a secondary signal from a log source
+    the attacker cannot easily disable (e.g., Azure AD logs vs. local Windows logs).
+
+Legitimate cover:
+  What authorized activity is indistinguishable from this attack pattern?
+  → This becomes your exclusion list. If no exclusion is possible, lower severity
+    and promote to HuntingQuery rather than AnalyticRule.
+
+Tool substitution:
+  Does the rule fire only on the reference tool (Mimikatz, Impacket) or on the
+  technique regardless of implementation?
+  → Test with at least two different tools before marking status: stable.
+```
+
+---
+
+### Detection Coverage Prioritization
+
+When deciding what to write next, work this priority order:
+
+1. **Techniques actively used against your industry or sector** (CTI-driven)
+   Check recent threat intel reports, ISACs, and vendor advisories.
+   A technique in 3 recent incidents is more important than ATT&CK coverage completeness.
+
+2. **Techniques with zero coverage in `mappings/`**
+   Run a coverage gap query against `mappings/attack_techniques.json` before starting.
+   No rule is worse than an imperfect rule — blank coverage means silent compromise.
+
+3. **Techniques covered only by IOC-based rules (Tier 6)**
+   These rules expire when threat actors rotate infrastructure.
+   Replace or supplement with a behavioral (Tier 1–3) rule.
+
+4. **Techniques covered by point-in-time rules but not longitudinal rules**
+   Patient attackers stay below short-window thresholds.
+   Add a companion HuntingQuery with a 7–30 day lookback.
+
+5. **Techniques adjacent to your existing coverage**
+   If you detect lateral movement via PtH, also detect lateral movement via PtK,
+   overpass-the-hash, and DCOM. Attackers pivot to adjacent techniques when blocked.
+
+---
+
+### Data Source Reliability
+
+Not every log source is equally trustworthy. Before writing a rule, assess the
+source on three axes:
+
+```
+Attacker controllability:
+  Can the attacker disable, tamper with, or avoid generating this log?
+  → Windows Security event log: attackers can clear it (EID 1102) or disable
+    audit policy. Prefer ETW-based sources (Sysmon, MDE) which are harder to silence.
+  → Azure AD / Entra ID logs: generated by Microsoft infrastructure, not the endpoint.
+    Attackers cannot suppress them. High reliability for cloud identity rules.
+  → Network flow logs: generated by network infrastructure outside attacker control.
+    High reliability for network rules once collected.
+
+Completeness:
+  Does this log source capture all variants of the behavior?
+  → Sysmon process creation (EID 1) does not capture WMIC-spawned processes if
+    WMI is not also monitored (EID 19/20/21). Check for gaps in your Sysmon config.
+  → SigninLogs captures interactive auth; AADNonInteractiveUserSignInLogs captures
+    app/token flows. Both are needed for credential attack coverage.
+
+Collection latency:
+  How long between event occurrence and availability in the SIEM?
+  → High-latency sources (>15 min) are unsuitable for AnalyticRule short lookbacks.
+    Use HuntingQuery with a wider window instead.
+```
+
+**Reliability ranking for common sources (high → low):**
+
+| Log source | Reliability | Notes |
+|---|---|---|
+| Azure AD / Entra ID (SigninLogs, AuditLogs) | Very high | Microsoft-generated; attacker cannot suppress |
+| MDE / Defender for Endpoint telemetry | High | ETW-based; requires tampered kernel to suppress |
+| Sysmon | High | ETW-based; survives most user-space tampering |
+| Windows Security Event Log | Medium | Attacker can clear log or disable audit policy |
+| Application and service logs | Medium-low | Vary by application; often incomplete |
+| Network device syslog | Medium | Depends on device config and syslog forwarding health |
+| Endpoint-agent-forwarded logs | Low-medium | Forwarding failures create silent gaps |
+
+---
+
+### Point-in-Time vs. Longitudinal Detection
+
+Every high-value rule should exist in two forms:
+
+**Point-in-time (AnalyticRule):** Short lookback (1h–24h). Fires in near-real-time.
+Catches active, noisy attacks. Threshold-based signals are evadable by a patient attacker.
+
+**Longitudinal (HuntingQuery):** Long lookback (7–30 days). Run on a schedule or
+manually. Catches slow-and-low patterns invisible to short windows.
+
+```
+When to add a longitudinal companion:
+  - Rule uses a volume/frequency threshold (Tier 5 signal)
+  - Attack can succeed across days rather than minutes (credential spray, recon)
+  - Rule looks for behavioral anomalies (unusual time, unusual location)
+
+Longitudinal pattern examples:
+  - Password spray: 1 failure/day against 50 accounts over 30 days = never trips
+    a 1h window. A 30-day `dcount(UserPrincipalName)` per source IP catches it.
+  - LDAP recon: 3 LDAP queries/hour from a workstation looks normal.
+    3,000 queries/day from a workstation that averaged 50/day last month is anomalous.
+  - Data staging: 100 MB exfiltrated at 3am once is invisible. The same volume
+    repeated over 14 nights is a pattern.
+```
+
+---
+
+### Threat Intelligence Integration
+
+Two modes — understand which you are doing and apply accordingly:
+
+**IOC-based detection (Tier 6):**
+- Matches known-bad IPs, hashes, domains from threat intel feeds
+- Expires when actors rotate infrastructure (days to weeks)
+- Use for: active incident response, short-term blocking, initial triage enrichment
+- Do NOT use as the sole signal in a production analytic rule
+
+**TTP-based detection (Tier 1–3):**
+- Matches adversary behavior regardless of infrastructure
+- Survives tool changes, IP rotation, hash modifications
+- Use for: all production analytic rules
+
+**Workflow when given an IOC or threat intel report:**
+```
+1. Map reported behavior to ATT&CK technique(s)
+2. Identify the unavoidable artifact (Q3 from Phase 0)
+3. Write the detection against the behavior — not the IOC
+4. Include the IOC as an enrichment signal or secondary filter:
+     | extend IsKnownBadIP = IPAddress in (ThreatIntelIPs)
+     | extend Severity = iff(IsKnownBadIP, "Critical", Severity)
+5. Add the IOC to a watchlist or threat intel table — not hardcoded in the rule
+6. Document the IOC expiry date in the rule header (when to remove the enrichment)
+```
+
+---
+
+### Detection Lifecycle
+
+A rule is not complete when it is written. It moves through stages:
+
+```
+Hypothesis
+  ↓ (ATT&CK technique identified, data source confirmed, Q1/Q2/Q3 answered)
+Signal Design
+  ↓ (signal tier selected, evasion documented, thresholds justified)
+Rule Development
+  ↓ (YAML written, exclusions applied, test cases generated)
+Evasion Review
+  ↓ (rule tested against at least 2 different tools; bypass paths documented)
+Testing / Staging
+  ↓ (deployed as HuntingQuery; run against 30 days of prod data; FP rate assessed)
+Promotion to Production
+  ↓ (converted to AnalyticRule if FP rate acceptable; suppression tuned)
+Monitoring
+  ↓ (alert volume tracked weekly; new FP sources investigated)
+Tuning
+  ↓ (exclusions updated; thresholds adjusted based on prod data)
+Retirement
+    (technique no longer relevant, or better rule supersedes this one)
+```
+
+**Promotion gates:**
+- HuntingQuery → AnalyticRule: FP rate < 5% over 30 days of prod data
+- AnalyticRule `status: experimental` → `status: stable`: no unresolved FPs in 60 days
+- Rule retirement: document the reason in git history; do not silently delete
+
+---
+
+### Adversarial Review Checklist
+
+Run this against every rule before marking `status: stable`.
+This is the "red team eye" pass — ask what an attacker who has read this rule would do.
+
+```
+[ ] A1. What is the minimum attacker action that avoids this rule entirely?
+        Document in a comment: "Evasion: attacker can bypass by [X]"
+
+[ ] A2. Does the rule fire on the technique or only on the reference tool?
+        Test with Mimikatz AND Impacket AND CobaltStrike (or their log equivalents).
+        If only one tool triggers it, tier is T4 — document accordingly.
+
+[ ] A3. Does the rule fire if the attacker slows down by 10x?
+        Replay the test events spread over 6h instead of 10min.
+        If not: add a longitudinal HuntingQuery companion.
+
+[ ] A4. Does the rule survive if the attacker changes one field it controls?
+        UserAgent, AppDisplayName, process name, source IP — attacker-supplied fields.
+        Anchor on OS/protocol fields where possible.
+
+[ ] A5. Does the rule survive a log source partial outage?
+        If the primary log source drops for 30 minutes, does the detection go blind?
+        Add a secondary data source or at minimum document the dependency.
+
+[ ] A6. Can the attacker blend into existing exclusions?
+        Service account list, admin workstation list, sanctioned apps list —
+        if an attacker can provision an account/host that lands in these lists,
+        they are permanently excluded. Audit watchlist hygiene.
+```
+
+---
+
+### Detection Anti-patterns
+
+Recognize and reject these before writing or approving a rule:
+
+| Anti-pattern | Problem | Fix |
+|---|---|---|
+| **IOC-only rule** | Expires with every infrastructure rotation | Add behavioral (T1–T3) signal; use IOC only for severity graduation |
+| **Threshold without longitudinal backup** | Patient attacker stays below threshold indefinitely | Write companion HuntingQuery with 7–30d lookback |
+| **Loudest-version-only** | Rule fires on `mimikatz.exe` but not on renamed binary | Anchor on technique artifact (EID, pipe, network call) not process name |
+| **Single log source dependency** | Log forwarding failure = silent blind spot | Add secondary source; document in `prerequisites:` |
+| **Hardcoded attacker infrastructure** | IPs/hashes/domains expire; hardcoded = forgotten | Use watchlist or threat-intel table; set expiry date |
+| **Over-suppressed rule** | Exclusion list so broad the rule never fires in prod | Each exclusion entry must be justified; audit quarterly |
+| **Lab-only test cases** | Synthetic test passes; prod is noisier | Use realistic field values from actual log samples |
+| **Missing deduplication** | One attack event creates 50 alert rows | Apply `summarize + arg_max` before `project` |
+| **Tactic-only ATT&CK tag** | `attack.credential-access` covers 30+ techniques | Require technique ID; tactic tag alone is insufficient |
+| **FP-only tuning** | Rule tuned until it stops firing — good attacks suppressed too | Tune FPs by adding specific exclusion values, never by raising thresholds blindly |
+
+---
+
 ## Standards
 
 Every Sigma rule you write or review must satisfy all five standards below. Flag any violation explicitly before proceeding.
