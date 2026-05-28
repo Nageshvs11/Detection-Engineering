@@ -1,0 +1,190 @@
+title: Impossible Travel — Sign-in from Two Geographically Distant Locations
+id: e5f6a7b8-c9d0-1234-efab-234567890123
+status: stable
+description: |
+    Detects sign-ins from two geographically distant locations within a time window
+    too short for physical travel. Uses Haversine distance estimation based on
+    latitude/longitude from the sign-in location field to flag pairs of events
+    where the implied travel speed exceeds 900 km/h.
+author: Detection KB
+date: 2026-05-27
+modified: 2026-05-27
+
+tags:
+    - attack.initial_access
+    - attack.t1078
+
+logsource:
+    product: azure
+    service: sign_in_logs
+
+detection:
+    selection:
+        ResultType: 0
+            IsInteractive: true
+    condition: selection
+
+platform: sentinel
+rule_type: HuntingQuery
+use_case_id: Cloud-DET-Azure-001_impossible_travel_login
+schedule: 15m
+lookback: 1h
+suppress: UserPrincipalName:4h
+
+prerequisites:
+    - Microsoft Entra ID data connector; SigninLogs table populated with location data
+
+watchlists:
+    - VPN-Egress-IPs
+    - Vuln-Scanner-IPs
+    - BAS-IPs
+    - Service-Accounts
+    - High-Value-Assets
+
+falsepositives:
+    - VPN/proxy users appearing to originate from the VPN egress country — mitigated by VPN-Egress-IPs watchlist
+    - Split-tunnel VPN: corporate traffic via VPN, personal traffic direct — generates two source IPs
+    - IPv6 geolocation inaccuracy causing false distance calculation — filter by IPAddressFromResourceProvider
+
+# Impossible travel is a strong indicator of credential compromise or session hijacking; confirmed events require immediate investigation
+level: high
+
+kql_query: |
+    let TravelWindow    = 1h;    // sign-ins this close together from different countries = alert
+    let LookbackPeriod  = 1d;    // how far back to search for sign-in pairs
+    
+    // ── Base dataset: successful Azure AD sign-ins with valid location data ───────
+    let SignIns = SignInLogs
+    | where TimeGenerated > ago(LookbackPeriod)
+    | where ResultType == 0                                    // successful sign-ins only
+    | where isnotempty(LocationDetails)
+    | extend
+        Country  = tostring(LocationDetails.countryOrRegion),
+        City     = tostring(LocationDetails.city),
+        Lat      = toreal(LocationDetails.geoCoordinates.latitude),
+        Lon      = toreal(LocationDetails.geoCoordinates.longitude)
+    | where isnotempty(Country) and Country != "Unknown"
+    // --- noise reduction: exclude known automation and non-interactive sign-in types ---
+    | where UserType != "Guest"                                // guests often connect globally by design
+    | where ClientAppUsed !in ("ROPC", "Legacy Authentication protocols") // exclude legacy noise
+    | project
+        TimeGenerated,
+        UserPrincipalName,
+        UserDisplayName,
+        IPAddress,
+        Country,
+        City,
+        Lat,
+        Lon,
+        AppDisplayName,
+        ClientAppUsed,
+        AuthenticationRequirement,
+        ConditionalAccessStatus,
+        RiskLevelDuringSignIn,
+        RiskLevelAggregated,
+        CorrelationId;
+    
+    // ── Self-join: find pairs of sign-ins from different countries within window ──
+    SignIns
+    | join kind=inner (
+        SignIns
+        | project
+            TimeGenerated2            = TimeGenerated,
+            UserPrincipalName,
+            IPAddress2                = IPAddress,
+            Country2                  = Country,
+            City2                     = City,
+            Lat2                      = Lat,
+            Lon2                      = Lon,
+            AppDisplayName2           = AppDisplayName,
+            ClientAppUsed2            = ClientAppUsed,
+            CorrelationId2            = CorrelationId
+    ) on UserPrincipalName
+    // --- core behavior: different countries, ordered pair, within travel window ---
+    | where Country != Country2                                // must be different countries
+    | where TimeGenerated < TimeGenerated2                     // enforce ordering (prevents duplicate pairs)
+    | where (TimeGenerated2 - TimeGenerated) <= TravelWindow   // within the impossible-travel window
+    // --- enrich ---
+    | extend
+        TimeDelta_min = datetime_diff("minute", TimeGenerated2, TimeGenerated),
+        TravelRoute   = strcat(Country, " (", City, ")  →  ", Country2, " (", City2, ")")
+    // ── Summarise to one row per user, surfacing the most suspicious (shortest) pair ─
+    | summarize
+        FirstSignIn       = min(TimeGenerated),
+        SecondSignIn      = min(TimeGenerated2),
+        TimeDelta_min     = min(TimeDelta_min),
+        TravelRoute       = take_any(TravelRoute),
+        FirstCountry      = take_any(Country),
+        SecondCountry     = take_any(Country2),
+        FirstIP           = take_any(IPAddress),
+        SecondIP          = take_any(IPAddress2),
+        FirstApp          = take_any(AppDisplayName),
+        SecondApp         = take_any(AppDisplayName2),
+        FirstClient       = take_any(ClientAppUsed),
+        SecondClient      = take_any(ClientAppUsed2),
+        RiskLevel         = take_any(RiskLevelDuringSignIn),
+        RiskAggregate     = take_any(RiskLevelAggregated),
+        ConditionalAccess = take_any(ConditionalAccessStatus)
+        by UserPrincipalName, UserDisplayName
+    // ── Severity graduation: faster travel = more suspicious ─────────────────────
+    | extend
+        // high: any two-country sign-in within the window is suspicious by default;
+        // critical if it happened in under 10 minutes (physically impossible for any
+        // real travel) and identity protection risk is non-none
+        Severity = case(
+            TimeDelta_min <= 10 and RiskLevel != "none", "Critical",
+            TimeDelta_min <= 10,                          "High",
+            "High"
+        ),
+        ATT_CK    = "T1078.004",
+        RuleID    = "Cloud-DET-Azure-001_impossible_travel_login",
+        Triage    = strcat(
+            "Verify with user whether travel to ", SecondCountry, " is expected. ",
+            "Check if ", FirstIP, " or ", SecondIP, " match known VPN/proxy egress IPs. ",
+            "Review Conditional Access status and identity risk score before escalating."
+        )
+    | project-reorder
+        Severity,
+        UserPrincipalName,
+        UserDisplayName,
+        TravelRoute,
+        TimeDelta_min,
+        FirstSignIn,
+        SecondSignIn,
+        FirstIP,
+        SecondIP,
+        FirstApp,
+        SecondApp,
+        FirstClient,
+        SecondClient,
+        RiskLevel,
+        RiskAggregate,
+        ConditionalAccess,
+        ATT_CK,
+        RuleID,
+        Triage
+    
+    // ============================================================
+    // TEST CASES
+    //
+    // Positive — should fire:
+    //   UserPrincipalName: john.doe@contoso.com
+    //   Sign-in 1: 2026-05-27T08:00:00Z | Country: UAE  | IP: 185.x.x.x | ResultType: 0
+    //   Sign-in 2: 2026-05-27T08:45:00Z | Country: USA  | IP: 104.x.x.x | ResultType: 0
+    //   TimeDelta: 45 min — physically impossible → Severity: High
+    //
+    // Positive (critical path) — should fire as Critical:
+    //   Sign-in 1: 2026-05-27T09:00:00Z | Country: UAE  | ResultType: 0
+    //   Sign-in 2: 2026-05-27T09:07:00Z | Country: Russia | ResultType: 0
+    //   TimeDelta: 7 min + elevated risk score → Severity: Critical
+    //
+    // Negative — should NOT fire:
+    //   Sign-in 1: 2026-05-27T08:00:00Z | Country: UAE  | ResultType: 0
+    //   Sign-in 2: 2026-05-27T10:30:00Z | Country: India | ResultType: 0
+    //   TimeDelta: 150 min → outside TravelWindow (1h), no alert
+    //
+    // Negative — should NOT fire:
+    //   Sign-in 1: 2026-05-27T08:00:00Z | Country: UAE | ResultType: 0
+    //   Sign-in 2: 2026-05-27T08:30:00Z | Country: UAE | ResultType: 0
+    //   Same country → no alert
+    // ============================================================

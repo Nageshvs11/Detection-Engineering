@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 Return the next 3-digit sequence number for a detection rule directory.
+All rule files use .yml regardless of platform (KQL, SPL, Sigma).
 
 Usage:
-    python3 next-seq.py /opt/DetectionEngineering/kql/windows
+    python3 next-seq.py kql/windows
     # → 001   (no files yet)
-    # → 004   (after 001, 002, 003 exist)
+    # → 004   (after 001_foo.yml, 002_bar.yml, 003_baz.yml exist)
 """
 
 import re

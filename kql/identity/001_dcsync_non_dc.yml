@@ -1,0 +1,186 @@
+title: DCSync — Non-Domain-Controller Account Performing AD Replication
+id: a1b2c3d4-e5f6-7890-abcd-ef0123456789
+status: stable
+description: |
+    Detects non-domain-controller accounts performing Active Directory replication
+    via the MS-DRSR (DRSUAPI) protocol — the mechanism used by Mimikatz dcsync,
+    Impacket secretsdump, and CobaltStrike hashdump to extract NTLM hashes and
+    Kerberos keys without touching LSASS on the DC.
+    Any user account, or a machine account not in the known DC list, triggering
+    DirectoryServicesReplication is highly suspicious.
+author: Detection KB
+date: 2026-05-27
+modified: 2026-05-27
+
+tags:
+    - attack.credential_access
+    - attack.t1003.006
+
+logsource:
+    product: azure
+    service: identity_directory_events
+
+detection:
+    selection:
+        ActionType: DirectoryServicesReplication
+    condition: selection
+
+platform: both
+rule_type: AnalyticRule
+use_case_id: OS-DET-AD-001_dcsync_non_dc
+schedule: 5m
+lookback: 1h
+suppress: AccountName:4h
+
+prerequisites:
+    - Microsoft Defender for Identity sensor on all DCs; Defender XDR data connector enabled in Sentinel
+
+watchlists:
+    - Service-Accounts
+    - High-Value-Assets
+
+falsepositives:
+    - Azure AD Connect / MSOL_* sync accounts performing password hash sync — add to Service-Accounts watchlist
+    - AD migration tools (Quest, Semperis) using replication APIs — correlate with change-management tickets
+    - New DC promotion — account appears briefly before inventory updates; short-lived
+
+# DirectoryServicesReplication from a user account has no legitimate use; direct path to all credential material in the domain
+level: critical
+
+kql_query: |
+    let KnownDCAccounts = IdentityInfo
+    | where TimeGenerated > ago(7d)
+    | where AccountType == "Machine"
+    | where isnotempty(OnPremSid)
+    // Domain controllers have the UF_SERVER_TRUST_ACCOUNT flag; Defender for Identity
+    // surfaces this in the Tags field as "Domain controller"
+    | where Tags has "Domain controller"
+    | summarize by AccountName = tolower(AccountName), AccountDomain = tolower(AccountDomain);
+    
+    // ── Known sync/backup exclusions ─────────────────────────────────────────────
+    // Add accounts here that legitimately use DRSUAPI (AAD Connect, migration tools).
+    // Keep this list short and audited — every entry is a detection blind spot.
+    let KnownSyncAccounts = datatable(AccountName: string, Reason: string)
+    [
+        // "msol_abc123def456", "Azure AD Connect password hash sync",
+        // "aadconnect_svc",    "Entra Connect service account",
+    ];
+    
+    // ── Core detection: DirectoryServicesReplication from non-DC account ─────────
+    IdentityDirectoryEvents
+    | where TimeGenerated > ago(1h)
+    | where ActionType == "DirectoryServicesReplication"
+    // --- normalise case for joins ---
+    | extend
+        AccountNameNorm   = tolower(AccountName),
+        AccountDomainNorm = tolower(AccountDomain)
+    // --- exclude legitimate DC-to-DC replication ---
+    | join kind=leftanti (
+        KnownDCAccounts
+        | project AccountName, AccountDomain
+    ) on $left.AccountNameNorm == $right.AccountName,
+      $left.AccountDomainNorm == $right.AccountDomain
+    // --- exclude known sync/backup accounts ---
+    | join kind=leftanti (
+        KnownSyncAccounts | project AccountName
+    ) on $left.AccountNameNorm == $right.AccountName
+    // ── Enrich with account context from IdentityInfo ─────────────────────────────
+    | join kind=leftouter (
+        IdentityInfo
+        | where TimeGenerated > ago(7d)
+        | summarize arg_max(TimeGenerated, *) by AccountObjectId
+        | project
+            AccountObjectId,
+            DisplayName         = AccountDisplayName,
+            JobTitle,
+            Department,
+            IsAccountEnabled,
+            IsMFARegistered,
+            AssignedRoles,
+            GroupMembership     = tostring(GroupMembership)
+    ) on AccountObjectId
+    // ── Flag machine accounts performing DCSync (rare but possible in tool abuse) ──
+    | extend
+        IsMachineAccount = AccountName endswith "$",
+        // Extract the DC being targeted (the destination of the replication request)
+        TargetDC = tostring(AdditionalFields.["DestinationDCName"])
+    // ── Severity graduation ───────────────────────────────────────────────────────
+    | extend
+        // Critical: user account (not a machine) doing DCSync — always a human attacker or
+        //           compromised credential; no legitimate scenario exists for this
+        // High: machine account that is NOT a DC — could be a service account or
+        //       renamed tool process abusing a machine credential
+        Severity = case(
+            not(IsMachineAccount),                         "Critical",
+            IsMachineAccount and isnotempty(TargetDC),     "High",
+            "High"
+        )
+    // ── Rule metadata ─────────────────────────────────────────────────────────────
+    | extend
+        ATT_CK  = "T1003.006",
+        RuleID  = "OS-DET-AD-001_dcsync_non_dc",
+        Triage  = strcat(
+            "1. Confirm ", AccountName, " is NOT a domain controller or sync account. ",
+            "2. Check DeviceName (", DeviceName, ") — is it a workstation, server, or DC? ",
+            "3. Pull full process tree from DeviceProcessEvents for this host in the same window. ",
+            "4. Isolate host immediately if a user account is the actor. ",
+            "5. Reset the account credential and audit NTLM hash exposure across the domain."
+        )
+    // ── Entity fields ─────────────────────────────────────────────────────────────
+    // Sentinel entity mapping: Account (AccountName + AccountDomain), Host (DeviceName)
+    // Defender XDR: AccountObjectId + DeviceName satisfy the required schema columns
+    | extend
+        AccountNameOut   = AccountName,
+        AccountDomainOut = AccountDomain
+    // ── Output ────────────────────────────────────────────────────────────────────
+    | project-reorder
+        Severity,
+        AccountNameOut,
+        AccountDomainOut,
+        DisplayName,
+        JobTitle,
+        Department,
+        IsAccountEnabled,
+        IsMFARegistered,
+        IsMachineAccount,
+        DeviceName,
+        IPAddress,
+        TargetDC,
+        TimeGenerated,
+        ActionType,
+        AssignedRoles,
+        GroupMembership,
+        AdditionalFields,
+        ATT_CK,
+        RuleID,
+        Triage
+    | sort by TimeGenerated asc
+    
+    // ============================================================
+    // TEST CASES
+    //
+    // Positive — should fire (Critical):
+    //   AccountName:   john.doe           (no trailing "$" — user account)
+    //   AccountDomain: contoso.com
+    //   ActionType:    DirectoryServicesReplication
+    //   DeviceName:    WORKSTATION01
+    //   Expected:      Severity = Critical
+    //
+    // Positive — should fire (High):
+    //   AccountName:   SVC_BACKUP$        (machine account but not in DC inventory)
+    //   AccountDomain: contoso.com
+    //   ActionType:    DirectoryServicesReplication
+    //   DeviceName:    BACKUPSRV01
+    //   Expected:      Severity = High
+    //
+    // Negative — should NOT fire (legitimate DC replication):
+    //   AccountName:   DC01$              (in KnownDCAccounts, tagged "Domain controller")
+    //   AccountDomain: contoso.com
+    //   ActionType:    DirectoryServicesReplication
+    //   Expected:      filtered by leftanti join on KnownDCAccounts
+    //
+    // Negative — should NOT fire (Azure AD Connect):
+    //   AccountName:   msol_abc123def456  (in KnownSyncAccounts)
+    //   ActionType:    DirectoryServicesReplication
+    //   Expected:      filtered by leftanti join on KnownSyncAccounts
+    // ============================================================

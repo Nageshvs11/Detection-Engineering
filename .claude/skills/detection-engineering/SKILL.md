@@ -175,7 +175,9 @@ KQL-specific and SPL-specific production requirements.
 [ ] U3. False positives section lists concrete scenarios — not just "Unknown"
         At minimum: which legitimate tools, accounts, or workflows could trigger this
 [ ] U4. At least one positive test case and one negative test case per filter block
-[ ] U5. Filename is lowercase_with_underscores (Sigma: .yml  KQL: .kql  SPL: .spl)
+[ ] U5. Filename is lowercase_with_underscores.yml — ALL formats use .yml
+        Sigma rules, KQL rules, and SPL rules are all stored as .yml files
+        Raw .kql and .spl extensions are not used — YAML is the single source format
 [ ] U6. Use case ID present in header — format: <prefix>-{NNN}_{description}
 [ ] U7. ATT&CK mappings file updated after writing or modifying a rule
 ```
@@ -346,12 +348,41 @@ KQL and SPL rules are written to a shared output tree. Sigma rules remain in
 the project `rules/` directory (YAML). Use the table below to determine the
 correct output path for every new rule.
 
-### Root paths
+### Rule format — YAML for all platforms
 
-| Format | Root |
-|--------|------|
-| KQL (Microsoft Sentinel / MDE) | `kql/` |
-| SPL (Splunk) | `splunk/` |
+All detection rules — Sigma, KQL, and SPL — are authored as `.yml` files
+following the Sigma rule schema. This provides a single industry-standard
+format, consistent metadata, and version-controlled history across all platforms.
+
+| Platform | Rule format | File extension | Root directory |
+|---|---|---|---|
+| Sigma (platform-agnostic) | Sigma YAML | `.yml` | `rules/` |
+| Microsoft Sentinel / Defender XDR | Sigma YAML + `kql_query:` block | `.yml` | `kql/` |
+| Splunk Enterprise Security | Sigma YAML + `spl_query:` block | `.yml` | `splunk/` |
+
+**Why YAML for KQL and SPL?**
+- Consistent format across all rule types — one schema to learn
+- Metadata (ATT&CK tags, severity, FPs, author, status) is always present
+- Rules are self-documenting and can be parsed by any Sigma-compatible tool
+- `kql_query:` / `spl_query:` blocks hold the full platform-specific query when
+  the standard Sigma `detection:` block cannot express Sentinel-specific features
+  (e.g. `_GetWatchlist()` joins, `IdentityInfo` enrichment, multi-branch unions)
+
+**sigma-cli conversion** (for rules where standard Sigma detection logic suffices):
+```bash
+# Convert to KQL (Microsoft 365 Defender backend)
+sigma convert -t microsoft365defender -p microsoft365defender rules/identity/dcsync.yml
+
+# Convert to SPL (Splunk backend)
+sigma convert -t splunk -p splunk rules/windows/pass_the_hash.yml
+```
+Install: `pip install sigma-cli pySigma-backend-microsoft365defender pySigma-backend-splunk`
+
+When a rule requires Sentinel watchlists or complex joins that sigma-cli cannot
+express, write the full query in the `kql_query:` block and leave `detection:`
+as a human-readable summary of the logic.
+
+### Root paths
 
 ### KQL table selection — data source → Sentinel table
 
@@ -520,17 +551,18 @@ app logs.
 Every file in a category directory is prefixed with a zero-padded 3-digit
 sequence number, followed by an underscore and a lowercase descriptive name.
 
-**Pattern:** `{NNN}_{description}.{ext}`
+**Pattern:** `{NNN}_{description}.yml`
 - `{NNN}` — next available sequence number in that directory (001, 002, … 999)
 - `{description}` — lowercase with underscores, no hyphens
-- `{ext}` — `kql` for KQL, `spl` for SPL
+- Extension is always `.yml` — all KQL, SPL, and Sigma rules use YAML format
 
 **Examples:**
 ```
-kql/windows/001_lsass_minidump_api.kql
-kql/windows/002_handala_wiper_chain.kql
-splunk/identity/001_kerberoasting_spn_enum.spl
-splunk/web/001_apache_log4j_exploit.spl
+kql/windows/001_lsass_minidump_api.yml
+kql/windows/002_handala_wiper_chain.yml
+splunk/identity/001_kerberoasting_spn_enum.yml
+splunk/web/001_apache_log4j_exploit.yml
+rules/proc_creation_win_hktl_mimikatz_command_line.yml
 ```
 
 ### Determining the next sequence number
@@ -543,7 +575,7 @@ python .claude/skills/detection-engineering/scripts/next-seq.py \
 # → 003   (if 001 and 002 already exist)
 ```
 
-Then name the file `{result}_{description}.kql` (or `.spl`).
+Then name the file `{result}_{description}.yml`.
 
 **Never reuse or skip sequence numbers.** If a rule file is deleted, the gap
 remains — do not renumber existing files.
@@ -747,127 +779,124 @@ guesses and rules will silently match nothing or fire on the wrong events.
 
 ### SPL rule template
 
-The template below is the canonical form for all SPL rules. Fill every header
-field — blank fields are deployment blockers.
+All SPL rules are authored as `.yml` files following the Sigma schema with a
+`spl_query:` block for the Splunk-specific query. Fill every field — blank
+fields are deployment blockers.
 
-```spl
-`comment("============================================================
-Use case ID:  <prefix>-{NNN}_{description}
-Rule:         {NNN}_{description}.spl
-ATT&CK:       T1XXX.YYY — <technique name>
-Severity:     low | medium | high | critical
-Author:       <author>
-Date:         YYYY-MM-DD
+```yaml
+title: <Short human-readable title>
+id: <uuid4>                  # python3 -c "import uuid; print(uuid.uuid4())"
+status: experimental         # experimental | test | stable | deprecated
+description: |
+    <Multi-line description: what attacker behaviour this detects, why it matters,
+    and which specific condition causes the rule to fire>
+author: <author>
+date: YYYY-MM-DD
+modified: YYYY-MM-DD
 
-Type:         CorrelationSearch | SavedSearch
-  CorrelationSearch  auto-creates notable event in Splunk ES; use when
-                     high-confidence and fewer than 10 hits/day expected
-  SavedSearch        analyst-reviewed report; use for new/noisy rules
-                     during 2-week probation before promoting
+# ATT&CK mapping — tactic tag + at least one technique tag required
+tags:
+    - attack.<tactic>          # e.g. attack.credential_access
+    - attack.tXXXX.YYY         # e.g. attack.t1558.003
 
-Index:        <pattern from SPL index routing table>
-  index=*-os-win     Windows Security Event Logs
-  index=*-os-linux   Linux /var/log/ logs
-  index=*-network    Network and security device syslog
-  index=*-edr        MDE / EDR telemetry
-  index=*-azure      Azure data sources (SignInLogs, AuditLogs, etc.)
+# Sigma logsource — closest standard category for cross-platform awareness
+logsource:
+    product: <windows|linux|network|azure>
+    # service: <security|syslog|...>
+    # category: <process_creation|network_connection|...>
 
-Schedule:     cron=<expression>  e.g. cron=*/5 * * * *
-Lookback:     earliest=-1h latest=now
-Suppress:     <field>:<Xh>  e.g. user:4h
+# Standard Sigma detection — fill where logic can be expressed in Sigma syntax
+# Leave empty and rely on spl_query when Splunk-specific features are needed
+detection:
+    selection:
+        <field>: <value>
+    filter_<name>:
+        <field>: <value>
+    condition: selection and not filter_<name>
 
-Prerequisite: <forwarder or data connector that must be active>
+# ── Splunk / Splunk ES metadata ──────────────────────────────────────────────
+platform: splunk
+rule_type: SavedSearch          # CorrelationSearch | SavedSearch | RBA Contributor
+use_case_id: <prefix>-NNN_description
+index: "*-<category>"           # *-os-win | *-os-linux | *-network | *-edr | *-azure
+sourcetype: <sourcetype>
+schedule: "*/5 * * * *"         # cron expression
+lookback: 1h
+suppress: <field>:<Xh>          # e.g. user:4h — omit if not applicable
 
-Lookup exclusions applied (see Exclusion Matrix):
-  [ ] vpn_egress_ips.csv       (network, identity, cloud — known egress IPs)
-  [ ] vuln_scanner_ips.csv     (any rule with a src_ip / dest_ip field)
-  [ ] bas_ips.csv              (any rule with a src_ip / dest_ip field)
-  [ ] service_accounts.csv     (identity, process, credential access rules)
-  [ ] admin_workstations.csv   (endpoint, lateral movement rules)
-  [ ] sanctioned_tools.csv     (process creation, execution rules)
-  [ ] high_value_assets.csv    (every rule — severity graduation)
-  Unchecked = not applicable; document why if unexpected.
+prerequisites:
+    - <Splunk Add-on or forwarder requirement>
 
-False positives:
-  - <concrete scenario 1>  mitigated by <lookup or filter>
-  - <concrete scenario 2>  mitigated by <lookup or filter>
-============================================================")`
+# Lookup CSV exclusions — uncomment every line that applies (see Exclusion Matrix)
+lookups:
+    # - vpn_egress_ips.csv         # network / identity / cloud — any rule with IP field
+    # - vuln_scanner_ips.csv       # any rule with src_ip or dest_ip
+    # - bas_ips.csv                # any rule with src_ip or dest_ip
+    # - service_accounts.csv       # identity / process / credential access rules
+    # - admin_workstations.csv     # endpoint / lateral movement rules
+    # - sanctioned_tools.csv       # process creation / execution rules
+    - high_value_assets.csv        # every rule — severity graduation (always include)
 
-`comment("── Core search ────────────────────────────────────────────────────")`
-index="*-<category>" sourcetype=<sourcetype>
-    earliest=-1h latest=now
-    <field>=<value>
+falsepositives:
+    - <concrete scenario 1> — mitigated by <lookup or filter>
+    - <concrete scenario 2> — mitigated by <lookup or filter>
 
-`comment("── Lookup exclusions (see Exclusion Matrix; delete blocks that do not apply) ─")`
-NOT [| inputlookup vpn_egress_ips.csv
-     | rename ip AS src_ip | table src_ip]
-NOT [| inputlookup vuln_scanner_ips.csv
-     | rename ip AS src_ip | table src_ip]
-NOT [| inputlookup bas_ips.csv
-     | rename ip AS src_ip | table src_ip]
-NOT [| inputlookup service_accounts.csv
-     | rename account AS user | table user]
-NOT [| inputlookup admin_workstations.csv
-     | rename hostname AS host | table host]
-NOT [| inputlookup sanctioned_tools.csv
-     | rename process_name AS process | table process]
+# Severity — low | medium | high | critical
+# Justification: <why this level — FP likelihood, blast radius if TP>
+level: high
 
-`comment("── Structural exclusions (invariants — hardcode acceptable) ───────")`
-NOT (user="SYSTEM" OR user="NT AUTHORITY\\SYSTEM" OR user="")
-
-`comment("── High-value asset enrichment and severity amplifier ─────────────")`
-| lookup high_value_assets.csv hostname AS host
-    OUTPUT criticality AS asset_criticality
-| eval severity=if(asset_criticality="critical" AND severity="high",
-                   "critical", severity)
-
-`comment("── [OPTIONAL] Identity enrichment — uncomment when CSV available ──")`
-`comment("| lookup user_identity.csv account AS user                         ")`
-`comment("    OUTPUT department, job_title, manager, mfa_registered          ")`
-
-`comment("── [OPTIONAL] Baseline / first-occurrence detection ──────────────")`
-`comment("| lookup baseline_summary.csv user AS user                         ")`
-`comment("    OUTPUT earliest_seen AS baseline_first_seen                    ")`
-`comment("| eval is_first_occurrence=if(isnull(baseline_first_seen), 1, 0)  ")`
-
-`comment("── [OPTIONAL] Risk-Based Alerting (Splunk ES RBA) ────────────────")`
-`comment("  Use for noisy signals: accumulate risk per entity across rules.  ")`
-`comment("  Alert fires from risk_notable when entity score exceeds threshold")`
-`comment("| eval risk_score=case(                                            ")`
-`comment("    is_first_occurrence=1 AND asset_criticality=\"critical\", 75,  ")`
-`comment("    is_first_occurrence=1, 50,                                     ")`
-`comment("    asset_criticality=\"critical\", 40,                            ")`
-`comment("    true(), 25)                                                    ")`
-`comment("| eval risk_object=\"user\", risk_object_type=user                 ")`
-`comment("| eval risk_message=\"<description of the risk>\"                  ")`
-`comment("| collect index=risk_index sourcetype=stash_new                   ")`
-
-`comment("── Rule metadata ──────────────────────────────────────────────────")`
-| eval
-    attck_technique = "T1XXX.YYY",
-    rule_id         = "<prefix>-{NNN}_{description}",
-    triage          = "1. <investigation step>. 2. <escalation step>."
-
-`comment("── Deduplication: one row per entity, not one row per raw event ───")`
-| stats
-    min(_time)              AS first_seen
-    max(_time)              AS last_seen
-    count                   AS event_count
-    values(<evidence_field>) AS evidence
-    latest(severity)        AS severity
-    latest(attck_technique) AS attck_technique
-    latest(rule_id)         AS rule_id
-    latest(triage)          AS triage
-    latest(asset_criticality) AS asset_criticality
-    by <entity_field>
-
-`comment("── Output ─────────────────────────────────────────────────────────")`
-| table
-    severity, <entity_field>,
-    first_seen, last_seen, event_count,
-    evidence, asset_criticality,
-    attck_technique, rule_id, triage
-| sort - severity, - event_count
+# ── SPL query ────────────────────────────────────────────────────────────────
+# Full production query. Keep all lookup exclusion blocks, enrichment,
+# deduplication stats, and output table.
+spl_query: |
+    index="*-<category>" sourcetype=<sourcetype>
+        earliest=-1h latest=now
+        <field>=<value>
+    NOT [| inputlookup vpn_egress_ips.csv
+         | rename ip AS src_ip | table src_ip]
+    NOT [| inputlookup vuln_scanner_ips.csv
+         | rename ip AS src_ip | table src_ip]
+    NOT [| inputlookup bas_ips.csv
+         | rename ip AS src_ip | table src_ip]
+    NOT [| inputlookup service_accounts.csv
+         | rename account AS user | table user]
+    NOT [| inputlookup admin_workstations.csv
+         | rename hostname AS host | table host]
+    NOT [| inputlookup sanctioned_tools.csv
+         | rename process_name AS process | table process]
+    | lookup high_value_assets.csv hostname AS host
+        OUTPUT criticality AS asset_criticality
+    | eval severity = if(asset_criticality="critical" AND severity="high",
+                         "critical", severity)
+    | eval
+        attck_technique = "T1XXX.YYY",
+        rule_id         = "<use_case_id>",
+        triage          = "1. <investigation step>. 2. <escalation step>."
+    | stats
+        min(_time)               AS first_seen
+        max(_time)               AS last_seen
+        count                    AS event_count
+        values(<evidence_field>) AS evidence
+        latest(severity)         AS severity
+        latest(attck_technique)  AS attck_technique
+        latest(rule_id)          AS rule_id
+        latest(triage)           AS triage
+        latest(asset_criticality) AS asset_criticality
+        by <entity_field>
+    | table
+        severity, <entity_field>,
+        first_seen, last_seen, event_count,
+        evidence, asset_criticality,
+        attck_technique, rule_id, triage
+    | sort - severity, - event_count
+    
+    `comment("── [OPTIONAL] Risk-Based Alerting — replace table/sort above ──────────")`
+    `comment("| eval risk_score = case(                                               ")`
+    `comment("    asset_criticality=\"critical\", 75,                                 ")`
+    `comment("    true(), 50)                                                          ")`
+    `comment("| eval risk_object = user, risk_object_type = \"user\"                  ")`
+    `comment("| eval risk_message = \"<describe risk>\"                               ")`
+    `comment("| collect index=risk_index sourcetype=stash_new                         ")`
 ```
 
 ### Watchlist Infrastructure
@@ -1028,183 +1057,171 @@ Is the signal weak alone but meaningful when combined with other signals?
 
 ### KQL rule template
 
-The template below is the canonical form for all KQL rules. Fill every header
-field — blank fields are deployment blockers.
+All KQL rules are authored as `.yml` files following the Sigma schema with a
+`kql_query:` block for the Sentinel/XDR-specific query. Fill every field —
+blank fields are deployment blockers.
 
-```kql
-// ============================================================
-// Use case ID:  <prefix>-{NNN}_{description}
-// Rule:         {NNN}_{description}.kql
-// ATT&CK:       T1XXX.YYY — <technique name>
-// Severity:     low | medium | high | critical
-// Author:       <author>
-// Date:         YYYY-MM-DD
-//
-// Type:         AnalyticRule | HuntingQuery
-//   AnalyticRule  → auto-creates incident on every match; < 10 alerts/day expected
-//   HuntingQuery  → analyst-reviewed; use until < 10 rows/day confirmed in production
-//
-// Target:       Sentinel | DefenderXDR | Both
-//   • Sentinel    → TimeGenerated; Sentinel-only tables (SigninLogs, SecurityEvent, etc.)
-//   • DefenderXDR → Timestamp; XDR Advanced Hunting tables (Device*, Identity*)
-//   • Both        → TimeGenerated; avoid tables absent from one console
-//
-// Schedule:     every <Xm|Xh>        (AnalyticRule only)
-// Lookback:     <Xh|Xd>              (must be ≥ Schedule interval)
-// Suppress:     none | <field>:<Xh>  (e.g. AccountName:4h)
-//
-// Prerequisite: <data connector that must be enabled>
-//
-// Watchlist exclusions applied (see Exclusion Matrix):
-//   [ ] VPN-Egress-IPs       (network, identity, cloud — known egress IPs)
-//   [ ] Vuln-Scanner-IPs     (any rule with a source IP)
-//   [ ] BAS-IPs              (any rule with a source IP)
-//   [ ] Service-Accounts     (identity, process, credential access rules)
-//   [ ] Admin-Workstations   (endpoint, lateral movement rules)
-//   [ ] Sanctioned-Tools     (process creation, execution rules)
-//   [ ] High-Value-Assets    (every rule — severity graduation)
-//   Unchecked = not applicable; add a comment explaining why if unexpected.
-//
-// False positives:
-//   - <concrete scenario 1> → mitigated by <watchlist or filter>
-//   - <concrete scenario 2> → mitigated by <watchlist or filter>
-// ============================================================
+```yaml
+title: <Short human-readable title>
+id: <uuid4>                  # python3 -c "import uuid; print(uuid.uuid4())"
+status: experimental         # experimental | test | stable | deprecated
+description: |
+    <Multi-line description: what attacker behaviour this detects, why it matters,
+    and which specific condition causes the rule to fire>
+author: <author>
+date: YYYY-MM-DD
+modified: YYYY-MM-DD
 
-// ── Watchlist exclusions (keep only blocks relevant to this rule — see Exclusion Matrix) ─
-let ExcludedVPNIPs = toscalar(
-    _GetWatchlist('VPN-Egress-IPs')
-    | summarize make_set(SearchKey));
-let ExcludedVulnScanners = toscalar(
-    _GetWatchlist('Vuln-Scanner-IPs')
-    | summarize make_set(SearchKey));
-let ExcludedBASIPs = toscalar(
-    _GetWatchlist('BAS-IPs')
-    | summarize make_set(SearchKey));
-let ExcludedServiceAccounts = toscalar(
-    _GetWatchlist('Service-Accounts')
-    | summarize make_set(tolower(SearchKey)));
-let ExcludedAdminHosts = toscalar(
-    _GetWatchlist('Admin-Workstations')
-    | summarize make_set(tolower(SearchKey)));
-let SanctionedTools = toscalar(
-    _GetWatchlist('Sanctioned-Tools')
-    | summarize make_set(tolower(SearchKey)));
-let HighValueAssets = toscalar(
-    _GetWatchlist('High-Value-Assets')
-    | summarize make_set(tolower(SearchKey)));
+# ATT&CK mapping — tactic tag + at least one technique tag required
+tags:
+    - attack.<tactic>          # e.g. attack.credential_access
+    - attack.tXXXX.YYY         # e.g. attack.t1003.006
 
-// ── Base query ────────────────────────────────────────────────────────────────
-<LogSource>
-| where TimeGenerated > ago(<Lookback>)   // swap to Timestamp for DefenderXDR target
-// --- core behavior ---
-| where <field> <operator> <value>
-// --- watchlist exclusions (remove lines not applicable to this rule's focus) ---
-| where IPAddress !in (ExcludedVPNIPs)           // network / identity rules
-| where IPAddress !in (ExcludedVulnScanners)     // any rule with a source IP
-| where IPAddress !in (ExcludedBASIPs)           // any rule with a source IP
-| where tolower(UserPrincipalName) !in (ExcludedServiceAccounts)
-| where tolower(DeviceName) !in (ExcludedAdminHosts)
-| where tolower(InitiatingProcessFileName) !in (SanctionedTools)
-// --- structural exclusions (invariants — hardcode acceptable) ---
-| where not(AccountName endswith "$")           // machine accounts
-| where AccountDomain !in~ ("NT AUTHORITY", "WINDOW MANAGER", "Font Driver Host")
+# Sigma logsource — closest standard category for cross-platform awareness
+logsource:
+    product: <windows|azure|linux|network>
+    # service: <security|signin|audit>
+    # category: <process_creation|network_connection|...>
 
-// ── [OPTIONAL] Entity enrichment — uncomment when IdentityInfo is available ──
-// | join kind=leftouter (
-//     IdentityInfo
-//     | where TimeGenerated > ago(7d)
-//     | summarize arg_max(TimeGenerated, *) by AccountObjectId
-//     | project AccountObjectId, JobTitle, Department,
-//               Manager = ManagerDisplayName, IsMFARegistered,
-//               AssignedRoles, IsAccountEnabled
-// ) on AccountObjectId
+# Standard Sigma detection — fill where logic can be expressed in Sigma syntax
+# Leave empty and rely on kql_query when Sentinel-specific features are needed
+# (e.g. _GetWatchlist(), IdentityInfo joins, multi-branch union logic)
+detection:
+    selection:
+        <field>: <value>
+    filter_<name>:
+        <field>: <value>
+    condition: selection and not filter_<name>
 
-// ── [OPTIONAL] Baseline comparison — uncomment for anomaly-based rules ────────
-// Compares current event count against a 30-day rolling baseline for the same entity.
-// IsFirstOccurrence = true is a strong high-confidence signal.
-// | join kind=leftouter (
-//     <LogSource>
-//     | where TimeGenerated between (ago(30d) .. ago(1h))
-//     | where <same_core_behavior_filter>
-//     | summarize BaselineCount = count() by <entity_field>
-// ) on <entity_field>
-// | extend IsFirstOccurrence = isempty(BaselineCount) or BaselineCount == 0
+# ── Sentinel / Defender XDR metadata ────────────────────────────────────────
+platform: sentinel          # sentinel | defenderxdr | both
+#   sentinel    → use TimeGenerated; Sentinel-only tables (SigninLogs, SecurityEvent)
+#   defenderxdr → use Timestamp; XDR Advanced Hunting tables (Device*, Identity*)
+#   both        → use TimeGenerated; avoid tables absent from one console
+rule_type: HuntingQuery     # AnalyticRule | HuntingQuery
+use_case_id: <prefix>-NNN_description
+schedule: 5m                # AnalyticRule only — omit for HuntingQuery
+lookback: 1h                # must be >= schedule interval
+suppress: <field>:<Xh>      # e.g. AccountName:4h — omit if not applicable
 
-// ── [OPTIONAL] Risk scoring — uncomment to replace binary threshold with score ─
-// Add one point per corroborating signal. Alert only when score ≥ threshold.
-// | extend
-//     Score_AfterHours  = iff(hourofday(TimeGenerated) !between (7 .. 19), 2, 0),
-//     Score_Weekend     = iff(dayofweek(TimeGenerated) in (0d, 6d), 1, 0),
-//     Score_HighRisk    = iff(RiskLevelDuringSignIn in ("high","medium"), 3, 0),
-//     Score_NewSource   = iff(IsFirstOccurrence == true, 3, 0),
-//     Score_CritAsset   = iff(tolower(DeviceName) in (HighValueAssets), 2, 0)
-// | extend TotalScore = Score_AfterHours + Score_Weekend + Score_HighRisk
-//                     + Score_NewSource + Score_CritAsset
-// | where TotalScore >= 4   // tune threshold; raise to reduce FPs
-// | extend Severity = case(TotalScore >= 7, "Critical",
-//                          TotalScore >= 4, "High", "Medium")
+prerequisites:
+    - <data connector that must be enabled>
 
-// ── Severity graduation: high-value asset amplifier ──────────────────────────
-| extend IsCriticalAsset = tolower(DeviceName) in (HighValueAssets)
-| extend Severity = case(
-    IsCriticalAsset, "Critical",
-    "<other_condition>", "High",
-    "<level>"
-)
+# Watchlist exclusions — uncomment every line that applies (see Exclusion Matrix)
+watchlists:
+    # - VPN-Egress-IPs        # network / identity / cloud — any rule with IP field
+    # - Vuln-Scanner-IPs      # any rule with a source IP field
+    # - BAS-IPs               # any rule with a source IP field
+    # - Service-Accounts      # identity / process / credential access rules
+    # - Admin-Workstations    # endpoint / lateral movement rules
+    # - Sanctioned-Tools      # process creation / execution rules
+    - High-Value-Assets       # every rule — severity graduation (always include)
 
-// ── Rule metadata ─────────────────────────────────────────────────────────────
-| extend
-    ATT_CK  = "T1XXX.YYY",
-    RuleID  = "<prefix>-{NNN}_{description}",
-    Triage  = strcat(
-        "1. Confirm <entity> is not excluded by watchlist. ",
-        "2. <investigation step>. ",
-        "3. <escalation step>."
+falsepositives:
+    - <concrete scenario 1> — mitigated by <watchlist or filter>
+    - <concrete scenario 2> — mitigated by <watchlist or filter>
+
+# Severity — low | medium | high | critical
+# Justification: <why this level — FP likelihood, blast radius if TP>
+level: critical
+
+# ── KQL query ────────────────────────────────────────────────────────────────
+# Full production query. Keep all watchlist let-blocks, optional enrichment
+# joins, deduplication summarize, entity extend, and final project.
+kql_query: |
+    // ── Watchlist exclusions ────────────────────────────────────────────────
+    let ExcludedVPNIPs = toscalar(
+        _GetWatchlist('VPN-Egress-IPs') | summarize make_set(SearchKey));
+    let ExcludedVulnScanners = toscalar(
+        _GetWatchlist('Vuln-Scanner-IPs') | summarize make_set(SearchKey));
+    let ExcludedBASIPs = toscalar(
+        _GetWatchlist('BAS-IPs') | summarize make_set(SearchKey));
+    let ExcludedServiceAccounts = toscalar(
+        _GetWatchlist('Service-Accounts') | summarize make_set(tolower(SearchKey)));
+    let ExcludedAdminHosts = toscalar(
+        _GetWatchlist('Admin-Workstations') | summarize make_set(tolower(SearchKey)));
+    let SanctionedTools = toscalar(
+        _GetWatchlist('Sanctioned-Tools') | summarize make_set(tolower(SearchKey)));
+    let HighValueAssets = toscalar(
+        _GetWatchlist('High-Value-Assets') | summarize make_set(tolower(SearchKey)));
+    //
+    // ── Base query ──────────────────────────────────────────────────────────
+    <LogSource>
+    | where TimeGenerated > ago(<Lookback>)   // swap to Timestamp for defenderxdr
+    // --- core behaviour ---
+    | where <field> <operator> <value>
+    // --- watchlist exclusions (remove lines not applicable to this rule) ---
+    | where IPAddress !in (ExcludedVPNIPs)           // network / identity rules
+    | where IPAddress !in (ExcludedVulnScanners)     // any rule with a source IP
+    | where IPAddress !in (ExcludedBASIPs)           // any rule with a source IP
+    | where tolower(UserPrincipalName) !in (ExcludedServiceAccounts)
+    | where tolower(DeviceName) !in (ExcludedAdminHosts)
+    | where tolower(InitiatingProcessFileName) !in (SanctionedTools)
+    // --- structural exclusions ---
+    | where not(AccountName endswith "$")
+    | where AccountDomain !in~ ("NT AUTHORITY", "WINDOW MANAGER", "Font Driver Host")
+    //
+    // ── [OPTIONAL] IdentityInfo enrichment ─────────────────────────────────
+    // | join kind=leftouter (
+    //     IdentityInfo | where TimeGenerated > ago(7d)
+    //     | summarize arg_max(TimeGenerated, *) by AccountObjectId
+    //     | project AccountObjectId, JobTitle, Department,
+    //               Manager = ManagerDisplayName, IsMFARegistered, AssignedRoles
+    // ) on AccountObjectId
+    //
+    // ── [OPTIONAL] Baseline comparison ─────────────────────────────────────
+    // | join kind=leftouter (
+    //     <LogSource>
+    //     | where TimeGenerated between (ago(30d) .. ago(1h))
+    //     | where <same_core_behaviour_filter>
+    //     | summarize BaselineCount = count() by <entity_field>
+    // ) on <entity_field>
+    // | extend IsFirstOccurrence = isempty(BaselineCount) or BaselineCount == 0
+    //
+    // ── [OPTIONAL] Risk scoring ─────────────────────────────────────────────
+    // | extend
+    //     Score_AfterHours = iff(hourofday(TimeGenerated) !between (7 .. 19), 2, 0),
+    //     Score_Weekend    = iff(dayofweek(TimeGenerated) in (0d, 6d), 1, 0),
+    //     Score_NewSource  = iff(IsFirstOccurrence == true, 3, 0),
+    //     Score_CritAsset  = iff(tolower(DeviceName) in (HighValueAssets), 2, 0)
+    // | extend TotalScore = Score_AfterHours + Score_Weekend + Score_NewSource + Score_CritAsset
+    // | where TotalScore >= 4
+    // | extend Severity = case(TotalScore >= 7, "Critical", TotalScore >= 4, "High", "Medium")
+    //
+    // ── Severity graduation ─────────────────────────────────────────────────
+    | extend IsCriticalAsset = tolower(DeviceName) in (HighValueAssets)
+    | extend Severity = case(
+        IsCriticalAsset, "Critical",
+        "<other_condition>", "High",
+        "<default_level>"
     )
-
-// ── Entity fields ─────────────────────────────────────────────────────────────
-// Account entity: AccountName + AccountDomain (Sentinel) | AccountObjectId (XDR)
-// Host entity:    Computer or DeviceName
-// IP entity:      IPAddress
-| extend
-    AccountName   = tostring(split(<upn_or_account_field>, "@")[0]),
-    AccountDomain = tostring(split(<upn_or_account_field>, "@")[1])
-
-// ── Deduplication — one alert row per entity, not one row per raw event ───────
-// Always summarize before the final project. One account/host generating 50 events
-// must produce ONE alert row. Use arg_max to surface the most recent event's fields.
-| summarize
-    FirstSeen    = min(TimeGenerated),
-    LastSeen     = max(TimeGenerated),
-    EventCount   = count(),
-    arg_max(TimeGenerated, *)          // pulls all columns from the most recent event
-    by AccountName, AccountDomain      // group key = the alerting entity
-
-// ── Output ────────────────────────────────────────────────────────────────────
-| project
-    Severity,
-    // --- identity ---
-    AccountName,
-    AccountDomain,
-    // --- host ---
-    Computer,           // or DeviceName for MDE tables
-    // --- network ---
-    IPAddress,
-    // --- timing ---
-    FirstSeen,
-    LastSeen,
-    EventCount,
-    // --- evidence ---
-    <key_fields>,
-    // --- enrichment (uncomment when joins are active) ---
-    // JobTitle, Department, Manager, IsMFARegistered, AssignedRoles,
-    // IsFirstOccurrence, BaselineCount,
-    IsCriticalAsset,
-    // --- rule metadata ---
-    ATT_CK,
-    RuleID,
-    Triage
-| sort by Severity asc, LastSeen desc
+    //
+    // ── Rule metadata ────────────────────────────────────────────────────────
+    | extend
+        ATT_CK = "T1XXX.YYY",
+        RuleID = "<use_case_id>",
+        Triage = strcat("1. <step>. 2. <step>. 3. <step>.")
+    //
+    // ── Entity fields (required for Sentinel alert mapping) ─────────────────
+    | extend
+        AccountName   = tostring(split(<upn_field>, "@")[0]),
+        AccountDomain = tostring(split(<upn_field>, "@")[1])
+    //
+    // ── Deduplication — one alert row per entity ────────────────────────────
+    | summarize
+        FirstSeen  = min(TimeGenerated),
+        LastSeen   = max(TimeGenerated),
+        EventCount = count(),
+        arg_max(TimeGenerated, *)
+        by AccountName, AccountDomain
+    //
+    // ── Output ──────────────────────────────────────────────────────────────
+    | project
+        Severity, AccountName, AccountDomain,
+        Computer, IPAddress,
+        FirstSeen, LastSeen, EventCount,
+        IsCriticalAsset, ATT_CK, RuleID, Triage
+    | sort by Severity asc, LastSeen desc
 ```
 
 #### Entity field mapping cheat-sheet
