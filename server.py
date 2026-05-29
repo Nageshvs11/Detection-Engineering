@@ -15,6 +15,7 @@ from pydantic import AnyUrl
 RULES_DIR    = Path(__file__).parent / "rules"
 MAPPINGS_DIR = Path(__file__).parent / "mappings"
 ATTACK_FILE  = MAPPINGS_DIR / "attack_techniques.json"
+DE_REPO      = Path("/opt/DetectionEngineering")   # canonical production rule store
 
 server = Server("detection-kb")
 
@@ -24,12 +25,23 @@ server = Server("detection-kb")
 # ---------------------------------------------------------------------------
 
 def _load_rules() -> dict[str, dict]:
-    """Return {stem: rule_dict} for every parseable YAML in rules/."""
+    """Return {stem: rule_dict} from Sigma reference rules + production DetectionEngineering repo."""
     rules: dict[str, dict] = {}
-    for path in sorted(RULES_DIR.glob("*.yml")):
+
+    sources: list[Path] = []
+    if RULES_DIR.exists():
+        sources.extend(sorted(RULES_DIR.glob("*.yml")))
+    for subdir in ("kql", "spl", "edr"):
+        target = DE_REPO / subdir
+        if target.exists():
+            sources.extend(sorted(target.rglob("*.yml")))
+
+    for path in sources:
         try:
             data = yaml.safe_load(path.read_text())
-            if isinstance(data, dict):
+            if isinstance(data, dict) and any(
+                str(t).startswith("attack.t") for t in (data.get("tags") or [])
+            ):
                 rules[path.stem] = data
         except Exception:
             pass
