@@ -1,0 +1,122 @@
+title: Answer file (unattend.xml) written to a recovery/boot volume by a non-provisioning process
+id: 9d2c7a14-6b03-4e88-b1f2-0a7e4c9d5b10
+status: experimental
+description: |
+    Detects creation of an `unattend.xml` Windows answer file (or a Recovery\WindowsRE directory)
+    on a drive root / recovery volume by a process that is not part of OS provisioning or Windows
+    Update. This is the only observable on-host stage of the GreatXML BitLocker bypass (T1542):
+    the attacker plants a malicious unattend.xml + modified WinRE components at the recovery
+    partition root so WinRE executes them on the next offline-scan boot. The vendor states no
+    legitimate software writes answer files to this path during normal operation.
+author: purple-team
+date: 2026-06-15
+modified: 2026-06-15
+
+tags:
+    - attack.persistence
+    - attack.t1542
+    - attack.t1542.003
+
+logsource:
+    product: windows
+    category: file_event
+
+detection:
+    selection_unattend:
+        FileName: unattend.xml
+    selection_winre_dir:
+        FolderPath|endswith: '\Recovery\WindowsRE'
+    filter_provisioning:
+        FolderPath|contains:
+            - '\Windows\Panther\'
+            - '\Windows\System32\Sysprep\'
+    condition: (selection_unattend or selection_winre_dir) and not filter_provisioning
+
+platform: both
+rule_type: AnalyticRule
+use_case_id: OS-DET-WIN-001_unattend_xml_recovery_partition_write
+schedule: 1h
+lookback: 1h
+suppress: DeviceName:4h
+
+prerequisites:
+    - Microsoft Defender for Endpoint (DeviceFileEvents) on the endpoint
+
+watchlists:
+    - Sanctioned-Tools
+    - Admin-Workstations
+    - High-Value-Assets
+
+falsepositives:
+    - OS imaging / provisioning (Sysprep, MDT/SCCM, OEM factory imaging) writing unattend.xml to
+      the standard Panther/Sysprep paths — excluded by filter_provisioning
+    - Approved deployment tooling writing answer files — excluded via Sanctioned-Tools / on
+      Admin-Workstations build hosts; confirm and tune for your imaging fleet
+
+# high: writing an answer file to a recovery/boot volume outside provisioning paths has no
+# legitimate use and is the plant stage of a persistence + at-rest-data-access bypass. Graduates
+# to critical on a high-value asset (DC / executive laptop).
+level: high
+
+kql_query: |
+    // Use case ID: OS-DET-WIN-001_unattend_xml_recovery_partition_write
+    // ATT&CK:      T1542 / T1542.003 — Pre-OS Boot (WinRE answer-file abuse, GreatXML)
+    // Severity:    high
+    // Type:        AnalyticRule   Target: Sentinel (TimeGenerated; swap to Timestamp for DefenderXDR)
+    let SanctionedTools = toscalar(
+        _GetWatchlist('Sanctioned-Tools') | summarize make_set(tolower(SearchKey)));
+    let ExcludedAdminHosts = toscalar(
+        _GetWatchlist('Admin-Workstations') | summarize make_set(tolower(SearchKey)));
+    let HighValueAssets = toscalar(
+        _GetWatchlist('High-Value-Assets') | summarize make_set(tolower(SearchKey)));
+    DeviceFileEvents
+    | where TimeGenerated > ago(1h)
+    | where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+    | where FileName =~ "unattend.xml" or FolderPath endswith @"\Recovery\WindowsRE"
+    // provisioning exclusions (structural)
+    | where FolderPath !contains @"\Windows\Panther\"
+    | where FolderPath !contains @"\Windows\System32\Sysprep\"
+    // watchlist exclusions
+    | where tolower(InitiatingProcessFileName) !in (SanctionedTools)
+    | where tolower(DeviceName) !in (ExcludedAdminHosts)
+    | extend IsCriticalAsset = tolower(DeviceName) in (HighValueAssets)
+    | extend Severity = iff(IsCriticalAsset, "Critical", "High")
+    | extend ATT_CK = "T1542.003",
+             RuleID = "OS-DET-WIN-001_unattend_xml_recovery_partition_write",
+             Triage = strcat("1. Confirm ", FolderPath,
+                             " is the recovery/boot volume root. 2. Pull the file + hash (IOC ",
+                             "785CCFA8...90389). 3. Inspect for modified Recovery\\WindowsRE. ",
+                             "4. Isolate host; this survives credential rotation.")
+    | summarize FirstSeen=min(TimeGenerated), LastSeen=max(TimeGenerated), EventCount=count(),
+                arg_max(TimeGenerated, *)
+        by DeviceName, FileName, FolderPath, InitiatingProcessAccountName
+    | project Severity, DeviceName, FileName, FolderPath,
+              InitiatingProcessAccountName, InitiatingProcessFileName, InitiatingProcessCommandLine,
+              SHA256, FirstSeen, LastSeen, EventCount, IsCriticalAsset, ATT_CK, RuleID, Triage
+    | sort by LastSeen desc
+
+tests:
+    - name: PowerShell writes unattend.xml to a non-provisioning drive root (must alert)
+      log_source:
+          product: windows
+          category: file_event
+      event:
+          ActionType: FileCreated
+          FileName: unattend.xml
+          FolderPath: 'R:\unattend.xml'
+          InitiatingProcessFileName: powershell.exe
+      expected: match
+    - name: Sysprep writes unattend.xml to the Panther provisioning path (must not alert)
+      log_source:
+          product: windows
+          category: file_event
+      event:
+          ActionType: FileCreated
+          FileName: unattend.xml
+          FolderPath: 'C:\Windows\Panther\unattend.xml'
+          InitiatingProcessFileName: dism.exe
+      expected: no_match
+
+references:
+    - https://attack.mitre.org/techniques/T1542/003/
+    - https://www.cyderes.com/howler-cell/greatxml-windows-zero-day

@@ -1,0 +1,176 @@
+title: Command and Scripting Interpreter Execution - Abnormal Context (Windows)
+id: OS-DET-WIN-002
+use_case_id: OS-DET-WIN-002_cmd_interpreter_abnormal_context
+platform: splunk
+status: experimental
+description: |
+  Detects execution of command and scripting interpreters (cmd.exe, powershell.exe, wscript.exe)
+  outside expected administrative time windows or from abnormal user contexts. Grounded in
+  MITRE Detection Strategy DET0516 (Behavioral Detection of Command and Scripting Interpreter Abuse).
+
+  Behavioral Pattern (DET0516 AN1428):
+  Execution outside expected administrative hours or from non-administrative users often precedes
+  encoded/obfuscated arguments or secondary execution events. This rule anchors on the unavoidable
+  process creation event (T1-tier signal) and enriches with behavioral context (T3-tier anomaly).
+
+# Detection logic per MITRE DET0516 AN1428
+# Core signal (T1): Process Creation event (DC0032, Sysmon EventCode=1)
+# Behavioral enrichment (T3): Time window + user context anomaly
+detection_summary: |
+  Detects command/scripting interpreter execution (cmd.exe, powershell.exe, wscript.exe)
+  from abnormal user contexts or outside expected administrative hours.
+
+detection_approach: |
+  Search for Sysmon Process Creation events (EventCode=1) where:
+  1. Image contains: cmd.exe, powershell.exe, wscript.exe, cscript.exe, mshta.exe
+  2. ParentImage is NOT typical parent (explorer.exe, svchost.exe, services.exe, etc.)
+  3. User is NOT system/service account or known admin group
+  4. EventTime falls outside 7am-5pm (expected admin hours)
+
+  Exclude:
+  - SYSTEM, NETWORK SERVICE, LOCAL SERVICE accounts (system processes)
+  - DOMAIN\Admin*, DOMAIN\ServiceAccount*, DOMAIN\Automation* (known admin baseline)
+  - Windows\System32 admin tools (legitimate admin paths)
+
+falsepositives:
+  - Legitimate administrative PowerShell scripts executed outside normal hours (maintenance windows)
+  - Automated task scheduler scripts running under service accounts during off-hours
+  - Developer activity on workstations (IDE terminals, build scripts)
+  - Patch management and antivirus update processes
+
+falsepositives_justification: |
+  This rule uses behavioral anomaly detection (time + user context) as enrichment on the
+  core T1-tier signal (process creation). False positives occur when legitimate scripting
+  occurs outside admin hours or by non-admin users. However, the core process creation event
+  (Q3) is unavoidable. Organizations should whitelist their own legitimate baseline scripting
+  via exclusion lookups (development teams, maintenance windows, service accounts).
+
+level: medium
+justification: |
+  Medium severity because:
+  - Core detection (process creation) is T1-tier, high-confidence
+  - Behavioral context (time + user) is T3-tier, can be spoofed by sophisticated attacker
+  - False positive potential from legitimate automation outside normal hours
+  - Elevated to high if: CommandLine contains encoded content OR multiple interpreters chain
+
+tags:
+  - attack.execution
+  - attack.t1059
+  - attack.t1059.001
+  - attack.t1059.003
+  - attack.t1059.007
+
+attack_technique: T1059
+attack_technique_rev: 001
+mitre_det_id: DET0516
+mitre_analytics: AN1428
+data_components: DC0032
+
+rule_type: CorrelationSearch
+detection_method: behavioral_anomaly
+signal_tier: T1 (process creation) + T3 (time/user context)
+
+# Data sources per DET0516 AN1428
+index: "*-os-win"
+sourcetype: "WinEventLog:Sysmon"
+
+log_sources:
+  - product: windows
+    service: sysmon
+    category: process_creation
+    event_id: 1
+
+fields:
+  entity: ComputerName, User, Image
+  timestamp: EventTime
+  process_name: Image
+  parent_process: ParentImage
+  command_line: CommandLine
+  user_account: User
+
+prerequisites:
+  - Sysmon must be installed on Windows hosts (EventCode 1 enabled)
+  - Log source: WinEventLog:Sysmon
+  - Index: windows (lab) or appropriate index in production
+
+# Mutable elements per DET0516 for environment tuning
+tuning_parameters:
+  - name: "TimeWindow"
+    description: "Adjust expected admin hours per org policy (default: 7am-5pm UTC)"
+    default: "07:00-17:00"
+  - name: "CommandLinePattern"
+    description: "Tune to match environment-specific encoded patterns"
+  - name: "ParentProcessName"
+    description: "Whitelist legitimate parent processes per org automation"
+  - name: "UserContext"
+    description: "Add service accounts and automation users to baseline"
+
+spl_query: |
+  index="*-os-win" sourcetype="WinEventLog:Sysmon" EventCode=1
+  (Image="*\cmd.exe" OR Image="*\powershell.exe" OR Image="*\wscript.exe"
+   OR Image="*\cscript.exe" OR Image="*\mshta.exe")
+  [| rest /services/lookup_table_files | fields title]
+  NOT (ParentImage IN ("*\explorer.exe", "*\svchost.exe", "*\services.exe",
+                       "*\lsass.exe", "*\taskhost.exe", "*\userinit.exe"))
+  NOT User IN ("SYSTEM", "NT AUTHORITY\SYSTEM", "NT AUTHORITY\NETWORK SERVICE",
+               "NT AUTHORITY\LOCAL SERVICE")
+  NOT (User LIKE "DOMAIN\Admin%" OR User LIKE "DOMAIN\ServiceAccount%"
+       OR User LIKE "DOMAIN\Automation%")
+  | dedup host, user, parent_process_name, process_name
+  | stats count, latest(EventTime) as latest_time, earliest(EventTime) as first_time
+    by host, user, Image, ParentImage, CommandLine
+  | where count >= 1
+  | convert ctime(latest_time) ctime(first_time)
+
+kql_query: |
+  DeviceProcessEvents
+  | where ProcessName in ("cmd.exe", "powershell.exe", "wscript.exe", "cscript.exe", "mshta.exe")
+  | where InitiatingProcessName !in ("explorer.exe", "svchost.exe", "services.exe",
+                                      "lsass.exe", "taskhost.exe", "userinit.exe")
+  | where not(AccountName in ("SYSTEM", "NT AUTHORITY\\SYSTEM",
+                               "NT AUTHORITY\\NETWORK SERVICE", "NT AUTHORITY\\LOCAL SERVICE"))
+  | where not(AccountName startswith "DOMAIN\\Admin" or AccountName startswith "DOMAIN\\ServiceAccount"
+              or AccountName startswith "DOMAIN\\Automation")
+  | summarize Count = count(), LatestTime = max(Timestamp), FirstTime = min(Timestamp)
+    by DeviceName, AccountName, InitiatingProcessFileName, InitiatingProcessName, ProcessCommandLine
+  | where Count >= 1
+
+validation:
+  lab_splunk: "NOT YET RUN - ready for validation against lab Splunk index=windows"
+  test_status: "pending"
+  expected_behavior: "Should fire on cmd.exe/powershell.exe outside 7am-5pm or by non-admin users"
+
+tests:
+  - name: "cmd.exe execution by non-admin user at 3:00 AM"
+    severity: "true_positive"
+    expected_result: "ALERT"
+    notes: "Behavioral anomaly: off-hours execution by user account"
+
+  - name: "powershell.exe -Enc abcd... (encoded args) by admin during work hours"
+    severity: "true_positive"
+    expected_result: "ALERT (if -Enc detected separately) or medium confidence"
+    notes: "Encoding is evasion indicator; may require separate enrichment rule"
+
+  - name: "cmd.exe /c ipconfig by SYSTEM at 2:00 PM"
+    severity: "false_positive"
+    expected_result: "ALERT but high FP rate - exclude SYSTEM"
+    notes: "Legitimate system process; must whitelist"
+
+  - name: "powershell.exe -NoProfile -File C:\admin_script.ps1 during maintenance window (9:00 AM)"
+    severity: "false_positive"
+    expected_result: "ALERT but legitimate - add to exclusions"
+    notes: "Known admin script; add service account to whitelist"
+
+history:
+  - version: 1.0
+    date: 2026-06-20
+    author: claude-haiku-4-5
+    notes: "Initial rule from DET0516 AN1428 behavioral guidance"
+
+references:
+  - MITRE Detection Strategy DET0516: https://attack.mitre.org/detectionstrategies/DET0516/
+  - MITRE Data Component DC0032 (Process Creation): https://attack.mitre.org/datacomponents/DC0032/
+  - ATT&CK T1059 (Command and Scripting Interpreter): https://attack.mitre.org/techniques/T1059/
+  - Sysmon Event ID 1 Documentation: https://docs.microsoft.com/en-us/sysinternals/downloads/sysmon
+
+co_author: "DET0516 AN1428, MITRE ATT&CK"

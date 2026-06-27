@@ -11,6 +11,9 @@ build/
 # SigmaHQ community clone — referenced locally, not tracked in this repo
 sigma-rules/
 
+# SIEM rule cache
+siem-cache/
+
 # Claude local settings (session-specific, not for sharing)
 .claude/settings.local.json
 
