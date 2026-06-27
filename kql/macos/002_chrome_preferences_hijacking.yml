@@ -1,0 +1,196 @@
+title: T1547.001 — macOS Browser Hijacking via Chrome Preferences Modification
+id: b8e4c9d3-2e5f-4c0a-9f6e-7e3b2d4f5a6c
+status: experimental
+description: |
+    Detects modification of Google Chrome's Secure Preferences file to redirect
+    searches and new tabs to attacker-controlled domains. This is a persistent browser
+    hijacking technique used by FlutterShell and similar adware malware to monetize
+    compromised systems. The modification targets the default_search_provider_data
+    block, forcing all user searches through an ad-filled intermediary site.
+
+author: Detection Engineering Team
+date: 2026-06-23
+modified: 2026-06-23
+
+tags:
+    - attack.persistence
+    - attack.t1547.001
+
+logsource:
+    product: macos
+    category: file_change
+
+detection:
+    selection_chrome_prefs:
+        File|endswith: "Secure Preferences"
+        File|contains: "Chrome/Default"
+    selection_modification:
+        EventType:
+            - FileCreated
+            - FileModified
+    selection_suspicious_content:
+        FileContent|contains:
+            - "default_search_provider_data"
+            - "new_tab_url"
+            - "url"
+    filter_legitimate:
+        ProcessName|in:
+            - Google Chrome Helper
+            - Google Chrome
+            - Terminal
+    condition: selection_chrome_prefs and selection_modification and selection_suspicious_content and not filter_legitimate
+
+tests:
+    - name: "Test Case 1: Malware modifying Chrome Secure Preferences"
+      description: "Detects modification of Secure Preferences by unauthorized process"
+      file_path: /Users/victim/Library/Application Support/Google/Chrome/Default/Secure Preferences
+      event_type: FileModified
+      file_content: "default_search_provider_data"
+      process_name: podcasts_lounge
+      expected_result: ALERT
+
+    - name: "Test Case 2: Browser hijacking to ad intermediary"
+      description: "Detects redirection to sinterfumesco.com via Secure Preferences"
+      file_path: /Users/victim/Library/Application Support/Google/Chrome/Default/Secure Preferences
+      event_type: FileModified
+      file_content: "sinterfumesco.com"
+      process_name: pdf-brain
+      expected_result: ALERT
+
+    - name: "Test Case 3: Legitimate Chrome update"
+      description: "Does NOT alert when Chrome itself modifies preferences"
+      file_path: /Users/victim/Library/Application Support/Google/Chrome/Default/Secure Preferences
+      event_type: FileModified
+      file_content: "default_search_provider_data"
+      process_name: Google Chrome
+      expected_result: NO_ALERT
+
+platform: defenderxdr
+rule_type: AnalyticRule
+use_case_id: OS-DET-MAC-002_chrome_preferences_hijacking
+schedule: 5m
+lookback: 1h
+suppress: DeviceName:4h
+
+prerequisites:
+    - Microsoft Defender for Endpoint (DeviceFileEvents or File Integrity Monitoring)
+    - macOS file monitoring enabled
+
+watchlists:
+    - High-Value-Assets
+
+falsepositives:
+    - Legitimate Chrome updates or profile migrations
+    - User-initiated Chrome settings modifications
+    - Browser extension installations that modify Chrome settings
+    - Chrome sync operations across multiple devices
+    - Chrome cleanup or cache management tools
+
+# high: direct path to persistent browser hijacking and monetization; no legitimate malware
+level: high
+
+kql_query: |
+    // Use case ID: OS-DET-MAC-002_chrome_preferences_hijacking
+    // ATT&CK:      T1547.001 — Boot or Logon Initialization Scripts: Registry Run Keys / Startup Folder
+    // Severity:    high
+    // Platform:    macOS
+    // Type:        AnalyticRule — alerts on file modification
+
+    let HighValueAssets = toscalar(
+        _GetWatchlist('High-Value-Assets') | summarize make_set(tolower(SearchKey)));
+
+    let KnownAdDomains = dynamic([
+        "sinterfumesco.com",
+        "atsheisdomestic.org",
+        "etoftheappyrince.org",
+        "healightejustb.org"
+    ]);
+
+    DeviceFileEvents
+    | where Timestamp > ago(1h)
+    | where Platform == "macOS"
+    // Target Chrome Secure Preferences file
+    | where FileName == "Secure Preferences"
+    | where FolderPath contains "Chrome/Default" or FolderPath contains "Chrome/Profile"
+    // File modification events
+    | where ActionType in ("FileCreated", "FileModified")
+    // Exclude Chrome's own processes
+    | where InitiatingProcessFileName !in ("Google Chrome", "Google Chrome Helper", "Chromium")
+    // Detect suspicious modification patterns
+    | extend IsSuspicious = (
+        RequestedAccess contains "write" or
+        ActionType == "FileModified"
+    )
+    | where IsSuspicious
+    // Check for known ad-hijacking domains in file content or path indicators
+    | extend IsKnownAdDomain = (
+        InitiatingProcessFileName in~ (
+            "podcasts_lounge",
+            "podcasts-lounge",
+            "pdf-brain",
+            "pdf_brain",
+            "pdf-ninja",
+            "pdf_ninja"
+        )
+    )
+    // Severity elevation
+    | extend Severity = case(
+        IsKnownAdDomain, "critical",
+        tolower(DeviceName) in~ (HighValueAssets), "high",
+        "high"
+    )
+    // Deduplication
+    | summarize
+        AlertCount = count(),
+        FirstSeen = min(Timestamp),
+        LastSeen = max(Timestamp),
+        ProcessNames = make_set(InitiatingProcessFileName)
+        by
+        DeviceId,
+        DeviceName,
+        InitiatingProcessFileName,
+        InitiatingProcessAccountName,
+        InitiatingProcessAccountDomain,
+        FolderPath,
+        Severity
+    // Final projection
+    | project
+        Timestamp = LastSeen,
+        DeviceId,
+        DeviceName,
+        ProcessName = InitiatingProcessFileName,
+        AccountName = InitiatingProcessAccountName,
+        AccountDomain = InitiatingProcessAccountDomain,
+        FilePath = FolderPath,
+        AlertCount,
+        FirstSeen,
+        LastSeen,
+        Severity,
+        TechniqueId = "T1547.001",
+        TechniqueName = "Boot or Logon Initialization Scripts — Registry Run Keys / Startup Folder",
+        TacticName = "Persistence"
+    | sort by Severity desc, LastSeen desc
+
+data_source:
+    primary: DeviceFileEvents (XDR Advanced Hunting)
+    platform: macOS
+    platform_version: "macOS 10.12+"
+
+enrichment:
+    - field: DeviceName
+      lookup_source: "Jamf or Apple MDM"
+      purpose: "Device type and management status"
+    - field: InitiatingProcessFileName
+      lookup_source: "Application Inventory"
+      purpose: "Application signature and notarization status"
+
+validation:
+    kql_syntax_check: PASS
+    sentinel_validation: PENDING
+    comment: "Requires file integrity monitoring or EDR file events enabled"
+
+references:
+    - "https://attack.mitre.org/techniques/T1547/"
+    - "https://attack.mitre.org/techniques/T1547/001/"
+    - "https://unit42.paloaltonetworks.com/flutterbridge-new-fluttershell-backdoor/"
+    - "https://www.sentinelone.com/blog/malvertising-chrome-hijacking/"

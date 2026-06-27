@@ -1,0 +1,100 @@
+title: Command and Scripting Interpreter Execution - Abnormal Context (Windows)
+id: OS-DET-WIN-002
+use_case_id: OS-DET-WIN-004_cmd_interpreter_abnormal_context
+platform: sentinel
+status: experimental
+description: |
+  Detects execution of command and scripting interpreters (cmd.exe, powershell.exe, wscript.exe)
+  outside expected administrative time windows or from abnormal user contexts. Grounded in
+  MITRE Detection Strategy DET0516 (Behavioral Detection of Command and Scripting Interpreter Abuse).
+
+attack_technique: T1059
+attack_technique_rev: 001
+mitre_det_id: DET0516
+mitre_analytics: AN1428
+data_components: DC0032
+
+level: medium
+justification: |
+  Medium severity because:
+  - Core detection (process creation) is T1-tier, high-confidence
+  - Behavioral context (time + user) is T3-tier, can be spoofed by sophisticated attacker
+  - False positive potential from legitimate automation outside normal hours
+
+rule_type: AnalyticRule
+detection_method: behavioral_anomaly
+signal_tier: T1 (process creation) + T3 (time/user context)
+
+log_sources:
+  - product: windows
+    service: defender
+    category: process_creation
+
+fields:
+  entity: DeviceName, AccountName, InitiatingProcessName
+  timestamp: Timestamp
+  process_name: ProcessName
+  parent_process: InitiatingProcessName
+  command_line: ProcessCommandLine
+  user_account: AccountName
+
+falsepositives:
+  - Legitimate administrative PowerShell scripts executed outside normal hours
+  - Automated task scheduler scripts running under service accounts
+  - Developer activity on workstations (IDE terminals, build scripts)
+  - Patch management and antivirus update processes
+
+kql_query: |
+  DeviceProcessEvents
+  | where ProcessName in ("cmd.exe", "powershell.exe", "wscript.exe", "cscript.exe", "mshta.exe")
+  | where InitiatingProcessName !in ("explorer.exe", "svchost.exe", "services.exe",
+                                      "lsass.exe", "taskhost.exe", "userinit.exe")
+  | where not(AccountName in ("SYSTEM", "NT AUTHORITY\\SYSTEM",
+                               "NT AUTHORITY\\NETWORK SERVICE", "NT AUTHORITY\\LOCAL SERVICE"))
+  | where not(AccountName startswith "DOMAIN\\Admin" or AccountName startswith "DOMAIN\\ServiceAccount"
+              or AccountName startswith "DOMAIN\\Automation")
+  | where hour(Timestamp) < 7 or hour(Timestamp) > 17
+  // Expected admin hours: 7:00 AM - 5:00 PM (7-17 = 7am to 5pm)
+  // Alert on execution outside these windows
+  | summarize Count = count(), LatestTime = max(Timestamp), FirstTime = min(Timestamp)
+    by DeviceName, AccountName, InitiatingProcessFileName, InitiatingProcessName, ProcessCommandLine
+  | where Count >= 1
+  | project-rename Entity = AccountName, LatestExecution = LatestTime, FirstExecution = FirstTime,
+                  ParentProcess = InitiatingProcessName, CommandLine = ProcessCommandLine
+
+# Sentinel-specific enrichment: High-Value-Assets severity graduation
+# (Uncomment when lookup is available in production Sentinel)
+# | lookup kind=leftouter HighValueAssets on $left.DeviceName == $right.ComputerName
+# | extend SeverityGraduated = iff(IsHighValueAsset == true, "high", "medium")
+
+tags:
+  - attack.execution
+  - attack.t1059
+  - attack.t1059.001
+  - attack.t1059.003
+  - attack.t1059.007
+
+validation:
+  status: "pending"
+  notes: "KQL rules validated in Sentinel environment (not available in lab)"
+
+tests:
+  - name: "cmd.exe execution by non-admin user at 3:00 AM"
+    severity: "true_positive"
+    expected_result: "ALERT"
+
+  - name: "powershell.exe by SYSTEM account"
+    severity: "false_positive"
+    expected_result: "FILTERED (SYSTEM exclusion)"
+
+references:
+  - MITRE Detection Strategy DET0516: https://attack.mitre.org/detectionstrategies/DET0516/
+  - MITRE Data Component DC0032: https://attack.mitre.org/datacomponents/DC0032/
+  - ATT&CK T1059: https://attack.mitre.org/techniques/T1059/
+  - Microsoft Defender Data: https://docs.microsoft.com/en-us/windows/security/threat-protection/
+
+history:
+  - version: 1.0
+    date: 2026-06-20
+    author: claude-haiku-4-5
+    notes: "Initial rule from DET0516 AN1428"

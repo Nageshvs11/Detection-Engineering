@@ -1,0 +1,214 @@
+title: T1529 — Browser Process Termination and Relaunching with Malicious Arguments
+id: e1h7f2g6-5h8i-7f3d-2i9h-0h6e5g7i8d9f
+status: experimental
+description: |
+    Detects suspicious termination of Google Chrome and immediate relaunching with
+    malicious URL arguments. Attackers use killall to forcefully terminate Chrome,
+    then relaunch it with URLs pointing to attacker-controlled ad-fraud sites,
+    suppressing normal crash-recovery dialogs. This technique is used by FlutterShell
+    to perform browser hijacking for monetization.
+
+author: Detection Engineering Team
+date: 2026-06-23
+modified: 2026-06-23
+
+tags:
+    - attack.impact
+    - attack.t1529
+
+logsource:
+    product: macos
+    category: process_creation
+
+detection:
+    selection_kill_chrome:
+        ProcessName|endswith:
+            - killall
+            - kill
+        ProcessCommandLine|contains:
+            - "Chrome"
+            - "Safari"
+            - "Firefox"
+    selection_relaunch_malicious:
+        ProcessCommandLine|contains:
+            - "https://"
+            - "sinterfumesco"
+            - "restore-last-session"
+            - "hide-crash-restore-bubble"
+            - "disable-session-crashed-bubble"
+    selection_suspicious_parent:
+        ParentProcessName|in:
+            - podcasts_lounge
+            - podcasts-lounge
+            - pdf-brain
+            - pdf_brain
+            - pdf-ninja
+            - pdf_ninja
+    condition: (selection_kill_chrome or selection_relaunch_malicious) and selection_suspicious_parent
+
+tests:
+    - name: "Test Case 1: Malware killing Chrome"
+      description: "Detects killall Chrome command from malware"
+      process_name: killall
+      parent_process_name: podcasts_lounge
+      command_line: killall "Google Chrome"
+      expected_result: ALERT
+
+    - name: "Test Case 2: Malware relaunching Chrome with malicious URL"
+      description: "Detects Chrome relaunch with ad-fraud URL and suppression flags"
+      process_name: Google Chrome
+      parent_process_name: pdf-brain
+      command_line: '/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome https://sinterfumesco.com/search?q=test --restore-last-session --hide-crash-restore-bubble'
+      expected_result: ALERT
+
+    - name: "Test Case 3: Normal Chrome restart"
+      description: "Does NOT alert when user restarts Chrome normally"
+      process_name: Google Chrome
+      parent_process_name: Terminal
+      command_line: open -a "Google Chrome"
+      expected_result: NO_ALERT
+
+platform: defenderxdr
+rule_type: AnalyticRule
+use_case_id: OS-DET-MAC-005_chrome_process_hijacking
+schedule: 5m
+lookback: 1h
+suppress: DeviceName:4h
+
+prerequisites:
+    - Microsoft Defender XDR Advanced Hunting (DeviceProcessEvents table)
+
+watchlists:
+    - High-Value-Assets
+
+falsepositives:
+    - System administration scripts that restart browsers
+    - IT support troubleshooting browser crashes
+    - Browser version updates that restart the process
+    - User manually closing and reopening Chrome
+
+# high: malicious browser hijacking with clear monetization intent
+level: high
+
+kql_query: |
+    // Use case ID: OS-DET-MAC-005_chrome_process_hijacking
+    // ATT&CK:      T1529 — System Shutdown/Reboot
+    // Severity:    high
+    // Platform:    macOS
+    // Type:        AnalyticRule — alerts on process chain anomalies
+
+    let HighValueAssets = toscalar(
+        _GetWatchlist('High-Value-Assets') | summarize make_set(tolower(SearchKey)));
+
+    let FlutterShellProcesses = dynamic([
+        "podcasts_lounge",
+        "podcasts-lounge",
+        "pdf-brain",
+        "pdf_brain",
+        "pdf-ninja",
+        "pdf_ninja"
+    ]);
+
+    let AdFraudDomains = dynamic([
+        "sinterfumesco.com",
+        "atsheisdomestic.org",
+        "etoftheappyrince.org",
+        "healightejustb.org"
+    ]);
+
+    // Phase 1: Detect Chrome termination by malware
+    let ChromeKills = DeviceProcessEvents
+        | where Timestamp > ago(1h)
+        | where Platform == "macOS"
+        | where ProcessName in ("killall", "kill")
+        | where ProcessCommandLine contains_cs "Chrome" or ProcessCommandLine contains_cs "Safari"
+        | where ParentProcessName in~ (FlutterShellProcesses)
+        | project
+            DeviceId,
+            KillTime = Timestamp,
+            KillingProcess = ProcessName,
+            KilledBrowser = case(
+                ProcessCommandLine contains "Chrome", "Google Chrome",
+                ProcessCommandLine contains "Safari", "Safari",
+                "Unknown"
+            ),
+            ParentProcess = ParentProcessName;
+
+    // Phase 2: Detect Chrome relaunch with malicious arguments
+    let ChromeRestarts = DeviceProcessEvents
+        | where Timestamp > ago(1h)
+        | where Platform == "macOS"
+        | where ProcessName in~ ("Google Chrome", "Safari", "Firefox")
+        | where ProcessCommandLine contains_cs "restore-last-session" or
+                ProcessCommandLine contains_cs "hide-crash-restore-bubble" or
+                ProcessCommandLine contains_cs "disable-session-crashed-bubble"
+        | where ProcessCommandLine has_any (AdFraudDomains)
+        | where ParentProcessName in~ (FlutterShellProcesses)
+        | project
+            DeviceId,
+            RestartTime = Timestamp,
+            RelaunhedBrowser = ProcessName,
+            MaliciousURL = ProcessCommandLine,
+            ParentProcess = ParentProcessName;
+
+    // Correlate kills and restarts
+    ChromeKills
+    | join kind=inner (ChromeRestarts) on DeviceId
+    | where datetime_diff('second', RestartTime, KillTime) between (0s .. 5s)  // Kill and restart within 5 seconds
+    | extend Severity = case(
+        tolower(DeviceId) in~ (HighValueAssets), "critical",
+        "high"
+    )
+    // Deduplication
+    | summarize
+        AlertCount = count(),
+        FirstIncident = min(KillTime),
+        LastIncident = max(RestartTime)
+        by
+        DeviceId,
+        KilledBrowser,
+        RelaunhedBrowser,
+        MaliciousURL,
+        ParentProcess,
+        Severity
+    // Final projection
+    | project
+        Timestamp = LastIncident,
+        DeviceId,
+        KilledBrowser,
+        RelaunhedBrowser,
+        MaliciousURL,
+        ParentProcess,
+        AlertCount,
+        FirstIncident,
+        LastIncident,
+        Severity,
+        TechniqueId = "T1529",
+        TechniqueName = "System Shutdown/Reboot",
+        TacticName = "Impact",
+        RecommendedAction = "Terminate parent process; restore Chrome settings; review browsing history for unauthorized access"
+    | sort by Severity desc, LastIncident desc
+
+data_source:
+    primary: DeviceProcessEvents (XDR Advanced Hunting)
+    platform: macOS
+    platform_version: "macOS 10.12+"
+
+enrichment:
+    - field: MaliciousURL
+      lookup_source: "Threat Intelligence feeds"
+      purpose: "Validate known-bad domain reputation"
+    - field: DeviceId
+      lookup_source: "Jamf or Apple MDM"
+      purpose: "Device quarantine and user notification"
+
+validation:
+    kql_syntax_check: PASS
+    sentinel_validation: PENDING
+    comment: "Correlation requires process event ordering; test with sequential Chrome termination events"
+
+references:
+    - "https://attack.mitre.org/techniques/T1529/"
+    - "https://unit42.paloaltonetworks.com/flutterbridge-new-fluttershell-backdoor/"
+    - "https://www.jamf.com/blog/how-malware-infects-macos/"
+    - "https://learn.microsoft.com/en-us/defender/advanced-hunting-deviceprocessevents-table"

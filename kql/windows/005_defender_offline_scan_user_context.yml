@@ -1,0 +1,97 @@
+title: Defender offline scan scheduled/initiated by a user-context process
+id: 4e8b1f72-9c30-4a55-8e21-3b6d0c7f9a42
+status: experimental
+description: |
+    Hunt for a Microsoft Defender offline scan being scheduled or initiated by a user/script
+    context rather than by an administrator interactively or by management tooling. In the GreatXML
+    chain (T1562.001) the attacker triggers an offline scan to force the host into the WinRE
+    offline-scan state required for the BitLocker bypass. Broad by design — surfaces candidates for
+    triage, especially when preceded by a recovery-partition file write on the same host.
+author: purple-team
+date: 2026-06-15
+modified: 2026-06-15
+
+tags:
+    - attack.defense_evasion
+    - attack.t1562.001
+
+logsource:
+    product: windows
+    category: process_creation
+
+detection:
+    selection:
+        - ProcessCommandLine|contains:
+              - 'WDOScan'
+              - 'OfflineScan'
+              - '-OfflineScanRequired'
+    condition: selection
+
+platform: both
+rule_type: HuntingQuery
+use_case_id: OS-DET-WIN-005_defender_offline_scan_user_context
+lookback: 30d
+
+prerequisites:
+    - Microsoft Defender for Endpoint (DeviceProcessEvents)
+
+watchlists:
+    - Service-Accounts
+    - Admin-Workstations
+    - High-Value-Assets
+
+falsepositives:
+    - Administrator legitimately running a Defender offline scan on a suspected-infected host
+    - Endpoint management / RMM tooling scheduling offline scans — excluded via Service-Accounts /
+      Admin-Workstations; review remaining user-context triggers
+
+# medium: scheduling an offline scan is itself benign and admin-initiated scans are common; the
+# signal is the user/script context and correlation with recovery-partition writes — hunt, not alert.
+level: medium
+
+kql_query: |
+    // Use case ID: OS-DET-WIN-005_defender_offline_scan_user_context
+    // ATT&CK:      T1562.001 — Impair Defenses (Defender offline scan abuse, GreatXML)
+    // Severity:    medium
+    // Type:        HuntingQuery   Target: Sentinel (TimeGenerated)   Window: 30d
+    let ExcludedServiceAccounts = toscalar(
+        _GetWatchlist('Service-Accounts') | summarize make_set(tolower(SearchKey)));
+    let ExcludedAdminHosts = toscalar(
+        _GetWatchlist('Admin-Workstations') | summarize make_set(tolower(SearchKey)));
+    DeviceProcessEvents
+    | where TimeGenerated > ago(30d)
+    | where (FileName in~ ("MpCmdRun.exe", "powershell.exe", "pwsh.exe")
+             and ProcessCommandLine has_any ("WDOScan", "OfflineScan", "OfflineScanRequired"))
+    // broaden: catch the cmdlet/binary regardless of casing; triage by initiating context
+    | where tolower(AccountName) !in (ExcludedServiceAccounts)
+    | where tolower(DeviceName) !in (ExcludedAdminHosts)
+    | summarize TriggerCount=count(), FirstSeen=min(TimeGenerated), LastSeen=max(TimeGenerated),
+                CommandLines=make_set(ProcessCommandLine, 10), Parents=make_set(InitiatingProcessFileName, 10)
+        by DeviceName, AccountName
+    | extend ATT_CK="T1562.001", RuleID="OS-DET-WIN-005_defender_offline_scan_user_context",
+             Triage="Pivot: was an unattend.xml / Recovery\\WindowsRE write seen on this host (OS-DET-WIN-001)? If so, treat as GreatXML staging."
+    | sort by LastSeen desc
+
+tests:
+    - name: powershell triggers a Defender offline scan in user context (must surface)
+      log_source:
+          product: windows
+          category: process_creation
+      event:
+          FileName: powershell.exe
+          ProcessCommandLine: 'Start-MpWDOScan'
+          AccountName: jsmith
+      expected: match
+    - name: routine process with no offline-scan command line (must not surface)
+      log_source:
+          product: windows
+          category: process_creation
+      event:
+          FileName: MpCmdRun.exe
+          ProcessCommandLine: '-Scan -ScanType 1'
+          AccountName: jsmith
+      expected: no_match
+
+references:
+    - https://attack.mitre.org/techniques/T1562/001/
+    - https://www.cyderes.com/howler-cell/greatxml-windows-zero-day

@@ -1,0 +1,140 @@
+title: Cisco SD-WAN Manager Successful su to Non-Standard Root-Equivalent Account
+id: 503dcccc-e749-4eac-85dc-083519012d9b
+status: experimental
+description: |
+    Detects a successful `su` command from the admin account to a non-standard account on a Cisco
+    Catalyst SD-WAN Manager device. In the documented campaign, the threat actor created a `troot`
+    account with UID 0 (root privileges) via CVE-2026-20245, then issued `su troot` from the admin
+    shell to gain a root shell.
+
+    On Cisco SD-WAN Manager, the admin account never has a legitimate need to use `su` to reach
+    any account other than root during debugging sessions authorized by Cisco TAC. Any `su` success
+    from admin to an account not in the authorized list (e.g., to `troot`, a newly created account)
+    is a near-binary indicator of post-exploitation.
+
+    Signal tier: T2 — auth.log `Successful su for [account] by admin` is unavoidably logged.
+
+    Evasion: attacker could use a different account name than `troot`; this rule catches any
+    `su` from admin to any account not in an exclusion list. An attacker who already has root
+    (from another method) would not need to su.
+
+author: purple-team
+date: 2026-06-27
+modified: 2026-06-27
+
+tags:
+    - attack.privilege_escalation
+    - attack.t1068
+    - attack.persistence
+    - attack.t1136.001
+
+logsource:
+    product: linux
+    service: auth
+    category: authentication
+
+detection:
+    selection_su_success:
+        process|startswith: su
+        message|contains|all:
+            - Successful su for
+            - by admin
+    filter_expected_targets:
+        message|contains:
+            - Successful su for root by admin
+    condition: selection_su_success and not filter_expected_targets
+
+# ── Splunk metadata ────────────────────────────────────────────────────────────
+platform: splunk
+rule_type: CorrelationSearch
+use_case_id: Network-DET-Cisco-003_cisco_sdwan_su_to_root_equiv_account
+index: "*-network"
+sourcetype: syslog
+schedule: "*/5 * * * *"
+lookback: 1h
+suppress: su_target:4h
+
+prerequisites:
+    - Cisco Catalyst SD-WAN Manager syslog (/var/log/auth.log) forwarded to Splunk
+    - index="*-network" sourcetype=syslog receiving vManage auth.log events
+    - "Note: filter_expected_targets excludes su root (legitimate TAC-authorized sessions); widen if organization routinely su's to other named accounts on SD-WAN Manager"
+
+lookups:
+    - high_value_assets.csv
+
+falsepositives:
+    - Authorized Cisco TAC-directed debugging sessions where admin su's to root are filtered
+      by the filter_expected_targets condition. If TAC sessions use a temporary named account,
+      add that account name to the filter or a lookup.
+    - BAS tools testing privilege escalation on SD-WAN Manager — these should fire and be
+      reviewed as expected exercise alerts; time-window suppress if running a scheduled exercise.
+
+# critical: admin su to any non-root account on SD-WAN Manager is a near-binary indicator;
+# the only documented legitimate use is `su root` for TAC-directed debugging, which is filtered
+level: critical
+
+validation:
+    status: NO-DATA
+    reason: source-silent — lab is Windows endpoint only; no SD-WAN Manager auth.log in Splunk;
+            Splunk credentials not configured for this session.
+    prod_query: |
+        index="*-network" sourcetype=syslog "Successful su for" "by admin" earliest=-24h | head 5
+
+tests:
+    - name: Successful su to troot by admin (exploit post-exploitation)
+      log_source:
+          product: linux
+          service: auth
+      event:
+          _raw: "Jan 01 08:03:00 vManage su[24289]: Successful su for troot by admin"
+          host: vManage
+          sourcetype: syslog
+      expected: match
+
+    - name: Successful su to root by admin (authorized TAC debugging — should not match)
+      log_source:
+          product: linux
+          service: auth
+      event:
+          _raw: "Jan 01 09:00:00 vManage su[30001]: Successful su for root by admin"
+          host: vManage
+          sourcetype: syslog
+      expected: no_match
+
+spl_query: |
+    index="*-network" sourcetype=syslog
+        earliest=-1h latest=now
+        "Successful su for" "by admin"
+    `comment("── Exclude: legitimate su to root (TAC-authorized debugging) ───────────")`
+    | where NOT match(_raw, "Successful su for root by admin")
+    `comment("── Extract su target account and SD-WAN host ──────────────────────────")`
+    | rex field=_raw
+        "Successful\s+su\s+for\s+(?P<su_target>\S+)\s+by\s+admin"
+    | rex field=_raw
+        "^(?:[A-Z][a-z]{2}\s+\d+\s+[\d:]+)\s+(?P<sdwan_host>\S+)\s+su"
+    `comment("── Severity graduation — high-value asset lookup ──────────────────────")`
+    | lookup high_value_assets.csv hostname AS sdwan_host
+        OUTPUT criticality AS asset_criticality
+    | eval severity = "critical"
+    `comment("── Rule metadata ──────────────────────────────────────────────────────")`
+    | eval
+        attck_technique = "T1068,T1136.001",
+        rule_id         = "Network-DET-Cisco-003_cisco_sdwan_su_to_root_equiv_account",
+        triage          = "1. CRITICAL: check /etc/passwd immediately for unauthorized UID 0 accounts: grep '^.*:x:0:' /etc/passwd. 2. Check /etc/shadow for corresponding entry (password hash). 3. Collect auth.log for admin account activity in the preceding hour. 4. Check for prior vScript log entries (evil_tenant.csv or similar). 5. If troot or similar account found: device is fully compromised — engage Cisco TAC and isolate immediately."
+    `comment("── Deduplicate — one alert per su target account ──────────────────────")`
+    | stats
+        min(_time)              AS first_seen
+        max(_time)              AS last_seen
+        count                   AS event_count
+        values(sdwan_host)      AS sdwan_hosts
+        latest(severity)        AS severity
+        latest(attck_technique) AS attck_technique
+        latest(rule_id)         AS rule_id
+        latest(triage)          AS triage
+        latest(asset_criticality) AS asset_criticality
+        by su_target
+    | table
+        severity, su_target, sdwan_hosts,
+        first_seen, last_seen, event_count,
+        asset_criticality, attck_technique, rule_id, triage
+    | sort - severity, - event_count

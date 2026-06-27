@@ -1,0 +1,152 @@
+title: Cisco SD-WAN Manager SSH Access as Default Account from External IP
+id: 2c8cdd63-3eb6-4bb6-a848-22892b73edb6
+status: experimental
+description: |
+    Detects successful SSH authentication to a Cisco Catalyst SD-WAN Manager using the default
+    administrative accounts (vmanage-admin, admin) from a non-RFC1918 source IP. In the documented
+    campaign, the threat actor used rogue peering to gain footing, then authenticated via SSH as
+    vmanage-admin from external IPs to execute follow-on commands.
+
+    Signal tier: T2 — SSH authentication events unavoidably appear in /var/log/auth.log forwarded
+    as syslog; anchor on default accounts + external source IPs.
+
+author: purple-team
+date: 2026-06-27
+modified: 2026-06-27
+
+tags:
+    - attack.initial_access
+    - attack.t1078.001
+    - attack.lateral_movement
+    - attack.t1021.004
+
+logsource:
+    product: linux
+    service: auth
+    category: authentication
+
+detection:
+    selection_ssh_accept:
+        ProcessName: sshd
+        SyslogMessage|contains: Accepted
+    selection_default_accounts:
+        SyslogMessage|contains:
+            - for vmanage-admin
+            - "for admin "
+    filter_private_ips:
+        SyslogMessage|re: 'from (10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+)'
+    condition: (selection_ssh_accept and selection_default_accounts) and not filter_private_ips
+
+# ── Sentinel metadata ─────────────────────────────────────────────────────────
+platform: sentinel
+rule_type: AnalyticRule
+use_case_id: Network-DET-Cisco-002_cisco_sdwan_external_ssh_default_account
+schedule: 5m
+lookback: 1h
+suppress: SourceIP:4h
+
+prerequisites:
+    - Cisco Catalyst SD-WAN Manager syslog (/var/log/auth.log) forwarded to Sentinel
+    - Syslog table receiving vManage auth.log events (ProcessName = "sshd")
+    - Admin-Workstations watchlist populated with authorized management IPs
+
+watchlists:
+    - Vuln-Scanner-IPs
+    - BAS-IPs
+    - Admin-Workstations
+    - High-Value-Assets
+
+falsepositives:
+    - Legitimate admin SSH from authorized management IPs excluded via Admin-Workstations watchlist
+    - Vulnerability scanners excluded via Vuln-Scanner-IPs watchlist
+    - BAS tools testing SSH excluded via BAS-IPs watchlist
+
+# high: SSH as default account from external IP is nearly always unauthorized;
+# Admin-Workstations watchlist handles the only legitimate case
+level: high
+
+tests:
+    - name: External SSH as vmanage-admin from threat actor IP
+      event:
+          ProcessName: sshd
+          SyslogMessage: "Accepted publickey for vmanage-admin from 126.51.108.152 port 48373 ssh2: RSA SHA256:REDACTED"
+          HostName: vManage
+      expected: match
+
+    - name: SSH as vmanage-admin from RFC1918 address (should not match)
+      event:
+          ProcessName: sshd
+          SyslogMessage: "Accepted publickey for vmanage-admin from 10.1.0.10 port 52341 ssh2: RSA SHA256:REDACTED"
+          HostName: vManage
+      expected: no_match
+
+kql_query: |
+    // Use case ID: Network-DET-Cisco-002_cisco_sdwan_external_ssh_default_account
+    // ATT&CK:      T1078.001 — Valid Accounts: Default Accounts
+    //              T1021.004 — Remote Services: SSH
+    // Severity:    high
+    // Target:      Sentinel (Syslog table)
+    //
+    // ── Watchlist exclusions ─────────────────────────────────────────────────
+    let ExcludedVulnScanners = toscalar(
+        _GetWatchlist('Vuln-Scanner-IPs') | summarize make_set(SearchKey));
+    let ExcludedBASIPs = toscalar(
+        _GetWatchlist('BAS-IPs') | summarize make_set(SearchKey));
+    let ExcludedMgmtHosts = toscalar(
+        _GetWatchlist('Admin-Workstations') | summarize make_set(SearchKey));
+    let HighValueAssets = toscalar(
+        _GetWatchlist('High-Value-Assets') | summarize make_set(tolower(SearchKey)));
+    //
+    // ── Base query: SSH accepted for default accounts ────────────────────────
+    Syslog
+    | where TimeGenerated > ago(1h)
+    | where ProcessName == "sshd"
+    | where SyslogMessage contains "Accepted"
+    | where SyslogMessage has_any ("for vmanage-admin", "for admin ")
+    //
+    // ── Extract source IP from auth.log format ────────────────────────────────
+    | parse SyslogMessage with * " from " SourceIP " port " SourcePort " " *
+    | where isnotempty(SourceIP)
+    //
+    // ── Exclude RFC1918 (internal) source IPs ────────────────────────────────
+    | where not(ipv4_is_private(SourceIP))
+    //
+    // ── Watchlist exclusions ─────────────────────────────────────────────────
+    | where SourceIP !in (ExcludedVulnScanners)
+    | where SourceIP !in (ExcludedBASIPs)
+    | where SourceIP !in (ExcludedMgmtHosts)   // authorized external mgmt IPs
+    //
+    // ── Extract account name ──────────────────────────────────────────────────
+    | parse SyslogMessage with * "for " AccountName " from " *
+    //
+    // ── Severity graduation ───────────────────────────────────────────────────
+    | extend IsCriticalAsset = tolower(HostName) in (HighValueAssets)
+    | extend Severity = case(IsCriticalAsset, "Critical", "High")
+    //
+    // ── Rule metadata ─────────────────────────────────────────────────────────
+    | extend
+        ATT_CK = "T1078.001, T1021.004",
+        RuleID = "Network-DET-Cisco-002_cisco_sdwan_external_ssh_default_account",
+        Triage = strcat(
+            "1. Verify whether this IP is an authorized management host not in Admin-Workstations. ",
+            "2. If unauthorized: revoke SSH key and force password reset on both default accounts. ",
+            "3. Collect auth.log for this IP across full timeframe. ",
+            "4. Check for subsequent su events and vScript log entries on same device. ",
+            "5. Review SD-WAN REST API access logs for config enumeration.")
+    //
+    // ── Deduplicate ───────────────────────────────────────────────────────────
+    | summarize
+        FirstSeen   = min(TimeGenerated),
+        LastSeen    = max(TimeGenerated),
+        EventCount  = count(),
+        Accounts    = make_set(AccountName),
+        SDWANHosts  = make_set(HostName),
+        arg_max(TimeGenerated, *)
+        by SourceIP
+    //
+    // ── Output ────────────────────────────────────────────────────────────────
+    | project
+        Severity, SourceIP, Accounts, SDWANHosts,
+        FirstSeen, LastSeen, EventCount,
+        IsCriticalAsset, ATT_CK, RuleID, Triage
+    | sort by Severity asc, LastSeen desc

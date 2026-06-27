@@ -1,0 +1,166 @@
+title: Cisco SD-WAN Manager REST API Fabric Configuration Enumeration from Unauthorized IP
+id: 266d27f8-cc00-4c8d-80c2-3281d7b2c58f
+status: experimental
+description: |
+    Detects access to Cisco Catalyst SD-WAN Manager REST API endpoints used for fabric topology
+    and configuration enumeration from source IPs not in the authorized management IP list.
+    In the documented campaign, the threat actor accessed /dataservice/system/device/vedges,
+    /dataservice/system/device/controllers, and /dataservice/template/config/* endpoints
+    after authenticating as the `admin` account via the web interface to exfiltrate the full
+    SD-WAN fabric configuration.
+
+    Signal tier: T2 — SD-WAN Manager web access logs MUST record all API calls with source IPs.
+    Filtering on specific high-value endpoints from non-management IPs creates a focused signal.
+
+    Evasion: attacker using a compromised authorized management IP would bypass this rule —
+    chain with rule 002 (external SSH) for a corroborating signal.
+
+    Note: web access logs use a different sourcetype from syslog auth events.
+    Verify log forwarding from /var/log/nms/ or nginx access logs on the SD-WAN Manager.
+
+author: purple-team
+date: 2026-06-27
+modified: 2026-06-27
+
+tags:
+    - attack.discovery
+    - attack.t1016
+    - attack.collection
+    - attack.t1005
+    - attack.exfiltration
+    - attack.t1041
+
+logsource:
+    product: cisco
+    service: sdwan
+    category: webserver
+
+detection:
+    selection_api_enum:
+        uri_path|contains:
+            - /dataservice/system/device/vedges
+            - /dataservice/system/device/controllers
+            - /dataservice/template/config/attached
+            - /dataservice/template/config/running
+        http_method: GET
+        http_status: 200
+    condition: selection_api_enum
+
+# ── Splunk metadata ────────────────────────────────────────────────────────────
+platform: splunk
+rule_type: SavedSearch
+use_case_id: Network-DET-Cisco-005_cisco_sdwan_rest_api_config_enumeration
+index: "*-network"
+sourcetype: cisco:sdwan:access
+schedule: "*/15 * * * *"
+lookback: 15m
+suppress: src_ip:2h
+
+prerequisites:
+    - Cisco Catalyst SD-WAN Manager web/nginx access logs forwarded to Splunk
+    - index="*-network" sourcetype=cisco:sdwan:access (or similar web access sourcetype)
+    - Verify with: index="*-network" "/dataservice/system/device/vedges" | head 5
+    - admin_workstations.csv populated with ALL authorized management IPs
+    - Note: log format may differ per SD-WAN version — adjust rex pattern if needed
+
+lookups:
+    - vuln_scanner_ips.csv
+    - bas_ips.csv
+    - admin_workstations.csv
+    - high_value_assets.csv
+
+falsepositives:
+    - Authorized SD-WAN administrators accessing fabric topology via web console or API scripts —
+      excluded via admin_workstations.csv (must be comprehensive and current)
+    - SD-WAN monitoring tools (Cisco vAnalytics, third-party NMS) that poll these endpoints —
+      add their IPs to admin_workstations.csv or a dedicated monitoring_ips lookup
+    - Vulnerability scanners crawling the management interface — excluded via vuln_scanner_ips.csv
+
+# medium: REST API access is normal management activity; relies on admin_workstations exclusion
+# being comprehensive — promote to high after validating management IP coverage
+level: medium
+
+validation:
+    status: NO-DATA
+    reason: source-silent — lab is Windows endpoint only; no SD-WAN web access logs in Splunk;
+            Splunk credentials not configured for this session.
+    prod_query: |
+        index="*-network" "/dataservice/system/device/vedges" earliest=-24h | head 5
+
+tests:
+    - name: External IP accessing SD-WAN fabric device list API
+      log_source:
+          product: cisco
+          service: sdwan
+      event:
+          _raw: '[2026-03-07T01:31:49.017Z] "GET /dataservice/system/device/vedges HTTP/1.1" 200 - 0 10114 127 - "126.51.108.152" "Mozilla/5.0" "LOGID" "192.168.1.10:8443" "127.0.0.1:8080"'
+          host: vManage
+          sourcetype: cisco:sdwan:access
+      expected: match
+
+    - name: Authorized management host accessing device list API (should not match)
+      log_source:
+          product: cisco
+          service: sdwan
+      event:
+          _raw: '[2026-03-07T09:00:00.000Z] "GET /dataservice/system/device/vedges HTTP/1.1" 200 - 0 10114 127 - "10.1.0.5" "Mozilla/5.0" "LOGID" "192.168.1.10:8443" "127.0.0.1:8080"'
+          host: vManage
+          sourcetype: cisco:sdwan:access
+      expected: no_match
+
+spl_query: |
+    `comment("── Hunt: SD-WAN REST API config enumeration from unauthorized IPs ──────")`
+    index="*-network" sourcetype=cisco:sdwan:access
+        earliest=-15m latest=now
+        ("/dataservice/system/device/vedges"
+         OR "/dataservice/system/device/controllers"
+         OR "/dataservice/template/config/")
+        "GET" "200"
+    `comment("── Exclude: vulnerability scanners ────────────────────────────────────")`
+    NOT [| inputlookup vuln_scanner_ips.csv | rename ip AS src_ip | table src_ip]
+    `comment("── Exclude: BAS platform IPs ───────────────────────────────────────────")`
+    NOT [| inputlookup bas_ips.csv | rename ip AS src_ip | table src_ip]
+    `comment("── Exclude: authorized management hosts ───────────────────────────────")`
+    NOT [| inputlookup admin_workstations.csv | rename ip AS src_ip | table src_ip]
+    `comment("── Extract fields from SD-WAN Manager web access log format ───────────")`
+    | rex field=_raw
+        "\"(?P<http_method>GET|POST|PUT|DELETE)\s+(?P<uri_path>/dataservice/\S+)\s+HTTP/[\d.]+"
+    | rex field=_raw
+        "\"(?P<http_status>\d{3})\s+-\s+\d+\s+(?P<response_bytes>\d+)"
+    | rex field=_raw
+        "-\s+\"(?P<src_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\"\s+\"(?P<user_agent>[^\"]+)\""
+    | rex field=_raw
+        "^(?:[A-Z][a-z]{2}\s+\d+\s+[\d:]+)\s+(?P<sdwan_host>\S+)"
+    `comment("── Filter: exclude RFC1918 management IPs not yet in lookup ───────────")`
+    | where NOT (cidrmatch("10.0.0.0/8", src_ip)
+              OR cidrmatch("172.16.0.0/12", src_ip)
+              OR cidrmatch("192.168.0.0/16", src_ip))
+    `comment("── Severity graduation ─────────────────────────────────────────────────")`
+    | lookup high_value_assets.csv hostname AS sdwan_host
+        OUTPUT criticality AS asset_criticality
+    | eval severity = if(asset_criticality="critical", "high", "medium")
+    `comment("── Rule metadata ──────────────────────────────────────────────────────")`
+    | eval
+        attck_technique  = "T1016,T1005,T1041",
+        rule_id          = "Network-DET-Cisco-005_cisco_sdwan_rest_api_config_enumeration",
+        triage           = "1. Verify whether the source IP is an authorized management host not in admin_workstations.csv — update the lookup if legitimate. 2. If unauthorized: pull all API calls from this IP in the past 24h. 3. Check the HTTP response sizes — large responses from /dataservice/template/config/* indicate configuration data was returned. 4. Correlate with SSH auth events from same IP (rule 002). 5. If unauthorized access confirmed: treat as active data collection — invoke IR."
+    `comment("── Aggregate — group API calls by source IP ────────────────────────────")`
+    | stats
+        min(_time)          AS first_seen
+        max(_time)          AS last_seen
+        count               AS api_call_count
+        values(uri_path)    AS endpoints_accessed
+        sum(eval(if(isnum(response_bytes), response_bytes, 0))) AS total_bytes_returned
+        values(sdwan_host)  AS sdwan_hosts
+        latest(severity)    AS severity
+        latest(attck_technique) AS attck_technique
+        latest(rule_id)     AS rule_id
+        latest(triage)      AS triage
+        latest(asset_criticality) AS asset_criticality
+        by src_ip, user_agent
+    | table
+        severity, src_ip, user_agent, api_call_count,
+        endpoints_accessed, total_bytes_returned, sdwan_hosts,
+        first_seen, last_seen,
+        asset_criticality, attck_technique, rule_id, triage
+    | sort - severity, - api_call_count

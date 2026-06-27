@@ -1,0 +1,207 @@
+title: T1005 — macOS Hardware Fingerprinting via ioreg Command Execution
+id: c9f5d0e4-3f6g-5d1b-0g7f-8f4c3e5g6b7d
+status: experimental
+description: |
+    Detects execution of the ioreg command to extract the IOPlatformUUID, a unique
+    hardware identifier used for device fingerprinting. Malware like FlutterShell
+    uses this command to collect system information before exfiltration or to ensure
+    unique tracking of compromised devices. Detection targets unusual process parents
+    executing ioreg with UUID-extraction flags.
+
+author: Detection Engineering Team
+date: 2026-06-23
+modified: 2026-06-23
+
+tags:
+    - attack.collection
+    - attack.t1005
+
+logsource:
+    product: macos
+    category: process_creation
+
+detection:
+    selection_ioreg:
+        ProcessName|endswith: ioreg
+    selection_uuid_extraction:
+        ProcessCommandLine|contains:
+            - "IOPlatformUUID"
+            - "IOPlatformExpertDevice"
+    selection_suspicious_parent:
+        ParentProcessName|in:
+            - Safari
+            - Chrome
+            - Firefox
+            - Mail
+            - Preview
+            - Finder
+            - Slack
+            - Discord
+            - podcasts_lounge
+            - pdf-brain
+            - pdf-ninja
+    filter_legitimate:
+        ProcessCommandLine|contains:
+            - "Terminal"
+            - "bash_profile"
+            - "profiles"
+    condition: selection_ioreg and selection_uuid_extraction and selection_suspicious_parent and not filter_legitimate
+
+tests:
+    - name: "Test Case 1: Malware executing ioreg for UUID extraction"
+      description: "Detects ioreg UUID extraction from malicious parent"
+      process_name: ioreg
+      parent_process_name: podcasts_lounge
+      command_line: ioreg -rd1 -c IOPlatformExpertDevice | grep IOPlatformUUID | sed 's/.*"IOPlatformUUID" = "//; s/"//g'
+      expected_result: ALERT
+
+    - name: "Test Case 2: Browser spawning ioreg for fingerprinting"
+      description: "Detects Safari spawning ioreg command"
+      process_name: ioreg
+      parent_process_name: Safari
+      command_line: ioreg -rd1 -c IOPlatformExpertDevice
+      expected_result: ALERT
+
+    - name: "Test Case 3: Legitimate Terminal ioreg invocation"
+      description: "Does NOT alert when user explicitly runs ioreg in Terminal"
+      process_name: ioreg
+      parent_process_name: Terminal
+      command_line: ioreg -p IOFDT -w0 | grep IOPlatformUUID
+      expected_result: NO_ALERT
+
+platform: defenderxdr
+rule_type: AnalyticRule
+use_case_id: OS-DET-MAC-003_hardware_fingerprinting_ioreg
+schedule: 5m
+lookback: 1h
+suppress: DeviceName:4h
+
+prerequisites:
+    - Microsoft Defender XDR Advanced Hunting (DeviceProcessEvents table)
+
+watchlists:
+    - High-Value-Assets
+
+falsepositives:
+    - System administration scripts gathering hardware information
+    - Legitimate device management tools (Jamf, MDM) collecting hardware IDs
+    - IT support diagnostics or inventory tools
+    - Apple system updates or maintenance processes
+    - User explicitly running system diagnostics
+
+# medium: fingerprinting is a precursor to exfiltration but has some legitimate uses
+level: medium
+
+kql_query: |
+    // Use case ID: OS-DET-MAC-003_hardware_fingerprinting_ioreg
+    // ATT&CK:      T1005 — Data from Local System
+    // Severity:    medium-high
+    // Platform:    macOS
+    // Type:        AnalyticRule — alerts on process execution
+
+    let HighValueAssets = toscalar(
+        _GetWatchlist('High-Value-Assets') | summarize make_set(tolower(SearchKey)));
+
+    let SuspiciousParents = dynamic([
+        "Safari",
+        "Chrome",
+        "Firefox",
+        "Mail",
+        "Preview",
+        "Finder",
+        "Slack",
+        "Discord",
+        "Zoom",
+        "podcasts_lounge",
+        "podcasts-lounge",
+        "pdf-brain",
+        "pdf_brain",
+        "pdf-ninja",
+        "pdf_ninja"
+    ]);
+
+    DeviceProcessEvents
+    | where Timestamp > ago(1h)
+    | where Platform == "macOS"
+    // Target ioreg process
+    | where ProcessName == "ioreg"
+    // Must contain UUID extraction indicators
+    | where ProcessCommandLine contains "IOPlatformUUID" or ProcessCommandLine contains "IOPlatformExpertDevice"
+    // From suspicious parent
+    | where ParentProcessName in~ (SuspiciousParents)
+    // Exclude legitimate contexts
+    | where ProcessCommandLine !contains "Terminal"
+    | where ProcessCommandLine !contains "bash_profile"
+    | where ProcessCommandLine !contains "/etc/profiles"
+    // Check for malware parent indicator
+    | extend IsFlutterShellVariant = (
+        ParentProcessName in~ (
+            "podcasts_lounge",
+            "podcasts-lounge",
+            "pdf-brain",
+            "pdf_brain",
+            "pdf-ninja",
+            "pdf_ninja"
+        )
+    )
+    // Severity elevation
+    | extend Severity = case(
+        IsFlutterShellVariant, "high",
+        tolower(DeviceName) in~ (HighValueAssets), "high",
+        "medium-high"
+    )
+    // Deduplication
+    | summarize
+        AlertCount = count(),
+        FirstSeen = min(Timestamp),
+        LastSeen = max(Timestamp),
+        CommandLines = make_set(ProcessCommandLine)
+        by
+        DeviceId,
+        DeviceName,
+        ParentProcessName,
+        InitiatingProcessAccountName,
+        InitiatingProcessAccountDomain,
+        IsFlutterShellVariant,
+        Severity
+    // Final projection
+    | project
+        Timestamp = LastSeen,
+        DeviceId,
+        DeviceName,
+        ParentProcessName,
+        AccountName = InitiatingProcessAccountName,
+        AccountDomain = InitiatingProcessAccountDomain,
+        CommandLines,
+        AlertCount,
+        FirstSeen,
+        LastSeen,
+        IsFlutterShellVariant,
+        Severity,
+        TechniqueId = "T1005",
+        TechniqueName = "Data from Local System",
+        TacticName = "Collection"
+    | sort by Severity desc, LastSeen desc
+
+data_source:
+    primary: DeviceProcessEvents (XDR Advanced Hunting)
+    platform: macOS
+    platform_version: "macOS 10.12+"
+
+enrichment:
+    - field: DeviceName
+      lookup_source: "Jamf or Apple MDM"
+      purpose: "Device type and management status"
+    - field: ParentProcessName
+      lookup_source: "Application Inventory"
+      purpose: "Application legitimacy assessment"
+
+validation:
+    kql_syntax_check: PASS
+    sentinel_validation: PENDING
+    comment: "Rule awaiting validation against lab XDR data"
+
+references:
+    - "https://attack.mitre.org/techniques/T1005/"
+    - "https://unit42.paloaltonetworks.com/flutterbridge-new-fluttershell-backdoor/"
+    - "https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/OSX_Interoperability/Articles/AboutKernelIntegration.html"

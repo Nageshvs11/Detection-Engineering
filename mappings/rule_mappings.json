@@ -1,0 +1,148 @@
+{
+  "T1542.003": [
+    {
+      "use_case_id": "OS-DET-WIN-001_unattend_xml_recovery_partition_write",
+      "platform": "kql",
+      "rule_type": "AnalyticRule",
+      "path": "/opt/DetectionEngineering/kql/windows/001_unattend_xml_recovery_partition_write.yml"
+    },
+    {
+      "use_case_id": "OS-DET-WIN-001_unattend_xml_recovery_partition_write",
+      "platform": "splunk",
+      "rule_type": "CorrelationSearch",
+      "path": "/opt/DetectionEngineering/splunk/windows/001_unattend_xml_recovery_partition_write.yml"
+    }
+  ],
+  "T1562.001": [
+    {
+      "use_case_id": "OS-DET-WIN-002_defender_offline_scan_user_context",
+      "platform": "kql",
+      "rule_type": "HuntingQuery",
+      "path": "/opt/DetectionEngineering/kql/windows/002_defender_offline_scan_user_context.yml"
+    }
+  ],
+  "T1068": [
+    {
+      "use_case_id": "Network-DET-Cisco-001_cisco_sdwan_cve_2026_20245_tenant_upload",
+      "platform": "kql",
+      "rule_type": "AnalyticRule",
+      "path": "/opt/DetectionEngineering/kql/network/001_cisco_sdwan_cve_2026_20245_tenant_upload.yml"
+    },
+    {
+      "use_case_id": "Network-DET-Cisco-001_cisco_sdwan_cve_2026_20245_tenant_upload",
+      "platform": "splunk",
+      "rule_type": "CorrelationSearch",
+      "path": "/opt/DetectionEngineering/splunk/network/001_cisco_sdwan_cve_2026_20245_tenant_upload.yml"
+    },
+    {
+      "use_case_id": "Network-DET-Cisco-003_cisco_sdwan_su_to_root_equiv_account",
+      "platform": "kql",
+      "rule_type": "AnalyticRule",
+      "path": "/opt/DetectionEngineering/kql/network/003_cisco_sdwan_su_to_root_equiv_account.yml"
+    },
+    {
+      "use_case_id": "Network-DET-Cisco-003_cisco_sdwan_su_to_root_equiv_account",
+      "platform": "splunk",
+      "rule_type": "CorrelationSearch",
+      "path": "/opt/DetectionEngineering/splunk/network/003_cisco_sdwan_su_to_root_equiv_account.yml"
+    }
+  ],
+  "T1059.004": [
+    {
+      "use_case_id": "Network-DET-Cisco-001_cisco_sdwan_cve_2026_20245_tenant_upload",
+      "platform": "kql",
+      "rule_type": "AnalyticRule",
+      "path": "/opt/DetectionEngineering/kql/network/001_cisco_sdwan_cve_2026_20245_tenant_upload.yml"
+    },
+    {
+      "use_case_id": "Network-DET-Cisco-001_cisco_sdwan_cve_2026_20245_tenant_upload",
+      "platform": "splunk",
+      "rule_type": "CorrelationSearch",
+      "path": "/opt/DetectionEngineering/splunk/network/001_cisco_sdwan_cve_2026_20245_tenant_upload.yml"
+    }
+  ],
+  "T1078.001": [
+    {
+      "use_case_id": "Network-DET-Cisco-002_cisco_sdwan_external_ssh_default_account",
+      "platform": "kql",
+      "rule_type": "AnalyticRule",
+      "path": "/opt/DetectionEngineering/kql/network/002_cisco_sdwan_external_ssh_default_account.yml"
+    },
+    {
+      "use_case_id": "Network-DET-Cisco-002_cisco_sdwan_external_ssh_default_account",
+      "platform": "splunk",
+      "rule_type": "CorrelationSearch",
+      "path": "/opt/DetectionEngineering/splunk/network/002_cisco_sdwan_external_ssh_default_account.yml"
+    }
+  ],
+  "T1021.004": [
+    {
+      "use_case_id": "Network-DET-Cisco-002_cisco_sdwan_external_ssh_default_account",
+      "platform": "kql",
+      "rule_type": "AnalyticRule",
+      "path": "/opt/DetectionEngineering/kql/network/002_cisco_sdwan_external_ssh_default_account.yml"
+    },
+    {
+      "use_case_id": "Network-DET-Cisco-002_cisco_sdwan_external_ssh_default_account",
+      "platform": "splunk",
+      "rule_type": "CorrelationSearch",
+      "path": "/opt/DetectionEngineering/splunk/network/002_cisco_sdwan_external_ssh_default_account.yml"
+    }
+  ],
+  "T1136.001": [
+    {
+      "use_case_id": "Network-DET-Cisco-003_cisco_sdwan_su_to_root_equiv_account",
+      "platform": "kql",
+      "rule_type": "AnalyticRule",
+      "path": "/opt/DetectionEngineering/kql/network/003_cisco_sdwan_su_to_root_equiv_account.yml"
+    },
+    {
+      "use_case_id": "Network-DET-Cisco-003_cisco_sdwan_su_to_root_equiv_account",
+      "platform": "splunk",
+      "rule_type": "CorrelationSearch",
+      "path": "/opt/DetectionEngineering/splunk/network/003_cisco_sdwan_su_to_root_equiv_account.yml"
+    }
+  ],
+  "T1098": [
+    {
+      "use_case_id": "Network-DET-Cisco-004_cisco_sdwan_admin_password_rapid_change",
+      "platform": "kql",
+      "rule_type": "HuntingQuery",
+      "path": "/opt/DetectionEngineering/kql/network/004_cisco_sdwan_admin_password_rapid_change.yml"
+    },
+    {
+      "use_case_id": "Network-DET-Cisco-004_cisco_sdwan_admin_password_rapid_change",
+      "platform": "splunk",
+      "rule_type": "SavedSearch",
+      "path": "/opt/DetectionEngineering/splunk/network/004_cisco_sdwan_admin_password_rapid_change.yml"
+    }
+  ],
+  "T1016": [
+    {
+      "use_case_id": "Network-DET-Cisco-005_cisco_sdwan_rest_api_config_enumeration",
+      "platform": "kql",
+      "rule_type": "HuntingQuery",
+      "path": "/opt/DetectionEngineering/kql/network/005_cisco_sdwan_rest_api_config_enumeration.yml"
+    },
+    {
+      "use_case_id": "Network-DET-Cisco-005_cisco_sdwan_rest_api_config_enumeration",
+      "platform": "splunk",
+      "rule_type": "SavedSearch",
+      "path": "/opt/DetectionEngineering/splunk/network/005_cisco_sdwan_rest_api_config_enumeration.yml"
+    }
+  ],
+  "T1005": [
+    {
+      "use_case_id": "Network-DET-Cisco-005_cisco_sdwan_rest_api_config_enumeration",
+      "platform": "kql",
+      "rule_type": "HuntingQuery",
+      "path": "/opt/DetectionEngineering/kql/network/005_cisco_sdwan_rest_api_config_enumeration.yml"
+    },
+    {
+      "use_case_id": "Network-DET-Cisco-005_cisco_sdwan_rest_api_config_enumeration",
+      "platform": "splunk",
+      "rule_type": "SavedSearch",
+      "path": "/opt/DetectionEngineering/splunk/network/005_cisco_sdwan_rest_api_config_enumeration.yml"
+    }
+  ]
+}

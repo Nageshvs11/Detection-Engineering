@@ -1,0 +1,164 @@
+title: Cisco SD-WAN Manager SSH Access as Default Account from External IP
+id: a096b411-ca4d-4130-9bab-53bb3c5b98ab
+status: experimental
+description: |
+    Detects successful SSH authentication to a Cisco Catalyst SD-WAN Manager using the default
+    administrative accounts (vmanage-admin, admin) from a non-RFC1918 source IP. In the documented
+    campaign, the threat actor used rogue peering access or stolen certificates to gain footing,
+    then authenticated via SSH as vmanage-admin from external IPs to execute commands.
+
+    The vmanage-admin and admin accounts are default accounts that should never accept connections
+    from external internet-routable IPs under normal operation. All legitimate administrative SSH
+    access should originate from known management hosts (admin_workstations lookup).
+
+    Signal tier: T2 — SSH authentication events are unavoidably logged in /var/log/auth.log;
+    anchored on default account names + external (non-RFC1918) source IPs.
+
+    Evasion: attacker could pivot through a compromised management host to blend with legitimate
+    traffic — admin_workstations exclusion handles this for known hosts; first-occurrence baseline
+    can catch new management IPs.
+
+author: purple-team
+date: 2026-06-27
+modified: 2026-06-27
+
+tags:
+    - attack.initial_access
+    - attack.t1078.001
+    - attack.lateral_movement
+    - attack.t1021.004
+
+logsource:
+    product: linux
+    service: auth
+    category: authentication
+
+detection:
+    selection_ssh_accept:
+        process: sshd
+        message|contains|all:
+            - Accepted
+    selection_default_accounts:
+        message|contains:
+            - for vmanage-admin
+            - "for admin "
+    filter_private_rfc1918:
+        message|re: 'from (10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+)'
+    condition: (selection_ssh_accept and selection_default_accounts) and not filter_private_rfc1918
+
+# ── Splunk metadata ────────────────────────────────────────────────────────────
+platform: splunk
+rule_type: CorrelationSearch
+use_case_id: Network-DET-Cisco-002_cisco_sdwan_external_ssh_default_account
+index: "*-network"
+sourcetype: syslog
+schedule: "*/5 * * * *"
+lookback: 1h
+suppress: src_ip:4h
+
+prerequisites:
+    - Cisco Catalyst SD-WAN Manager syslog (/var/log/auth.log) forwarded to Splunk
+    - index="*-network" sourcetype=syslog receiving vManage auth.log events
+    - admin_workstations.csv populated with all authorized management IPs and jump hosts
+
+lookups:
+    - vuln_scanner_ips.csv
+    - bas_ips.csv
+    - admin_workstations.csv
+    - high_value_assets.csv
+
+falsepositives:
+    - Legitimate administrator SSH from authorized management IPs — excluded via
+      admin_workstations.csv (populate with all PAW / jump host IPs and external CIDR if any)
+    - Vulnerability scanners probing SSH — excluded via vuln_scanner_ips.csv
+    - BAS tools testing SSH credential access — excluded via bas_ips.csv
+
+# high: external SSH as default account is nearly always unauthorized; exclusions handle
+# the only legitimate case (authorized management IPs via admin_workstations lookup)
+level: high
+
+validation:
+    status: NO-DATA
+    reason: source-silent — lab is Windows endpoint only; no SD-WAN Manager auth.log syslog
+            forwarded; Splunk credentials not configured for this session.
+    prod_query: |
+        index="*-network" sourcetype=syslog sshd Accepted
+        (vmanage-admin OR " admin ") earliest=-24h | head 5
+
+tests:
+    - name: External SSH as vmanage-admin from threat actor IP
+      log_source:
+          product: linux
+          service: auth
+      event:
+          _raw: "Jan 01 07:58:00 vManage sshd[20766]: Accepted publickey for vmanage-admin from 126.51.108.152 port 48373 ssh2: RSA SHA256:REDACTED"
+          host: vManage
+          sourcetype: syslog
+      expected: match
+
+    - name: External SSH as admin from threat actor IP
+      log_source:
+          product: linux
+          service: auth
+      event:
+          _raw: "Jan 01 08:01:00 vManage sshd[25178]: Accepted keyboard-interactive/pam for admin from 126.51.108.152 port 60552 ssh2"
+          host: vManage
+          sourcetype: syslog
+      expected: match
+
+    - name: Legitimate SSH as vmanage-admin from RFC1918 management host (should not match)
+      log_source:
+          product: linux
+          service: auth
+      event:
+          _raw: "Jan 01 09:00:00 vManage sshd[30001]: Accepted publickey for vmanage-admin from 10.1.0.10 port 52341 ssh2: RSA SHA256:REDACTED"
+          host: vManage
+          sourcetype: syslog
+      expected: no_match
+
+spl_query: |
+    index="*-network" sourcetype=syslog
+        earliest=-1h latest=now
+        sshd Accepted ("vmanage-admin" OR " admin ")
+    `comment("── Exclude: vulnerability scanners ────────────────────────────────────")`
+    NOT [| inputlookup vuln_scanner_ips.csv | rename ip AS src_ip | table src_ip]
+    `comment("── Exclude: BAS platform IPs ───────────────────────────────────────────")`
+    NOT [| inputlookup bas_ips.csv | rename ip AS src_ip | table src_ip]
+    `comment("── Exclude: authorized management hosts / jump servers ────────────────")`
+    NOT [| inputlookup admin_workstations.csv | rename ip AS src_ip | table src_ip]
+    `comment("── Extract fields from syslog auth.log format ─────────────────────────")`
+    | rex field=_raw
+        "Accepted\s+\S+\s+for\s+(?P<account>\S+)\s+from\s+(?P<src_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+port\s+(?P<src_port>\d+)"
+    | rex field=_raw "^(?:[A-Z][a-z]{2}\s+\d+\s+[\d:]+)\s+(?P<sdwan_host>\S+)\s+sshd"
+    `comment("── Filter: exclude RFC1918 source IPs ─────────────────────────────────")`
+    | where isnotnull(src_ip)
+    | where NOT (cidrmatch("10.0.0.0/8", src_ip)
+              OR cidrmatch("172.16.0.0/12", src_ip)
+              OR cidrmatch("192.168.0.0/16", src_ip))
+    `comment("── Severity graduation ─────────────────────────────────────────────────")`
+    | lookup high_value_assets.csv hostname AS sdwan_host
+        OUTPUT criticality AS asset_criticality
+    | eval severity = if(asset_criticality="critical", "critical", "high")
+    `comment("── Rule metadata ──────────────────────────────────────────────────────")`
+    | eval
+        attck_technique = "T1078.001,T1021.004",
+        rule_id         = "Network-DET-Cisco-002_cisco_sdwan_external_ssh_default_account",
+        triage          = "1. Verify whether this IP is an authorized management host not in admin_workstations.csv. 2. If unauthorized: immediately revoke SSH key and force password reset on vmanage-admin and admin. 3. Collect all auth.log entries for this source IP across the timeframe. 4. Check for subsequent su events and vScript log entries. 5. Review SD-WAN Manager web access logs for REST API calls from the same IP."
+    `comment("── Deduplicate — one alert per source IP ──────────────────────────────")`
+    | stats
+        min(_time)          AS first_seen
+        max(_time)          AS last_seen
+        count               AS event_count
+        values(account)     AS accounts
+        values(sdwan_host)  AS sdwan_hosts
+        latest(severity)    AS severity
+        latest(attck_technique) AS attck_technique
+        latest(rule_id)     AS rule_id
+        latest(triage)      AS triage
+        latest(asset_criticality) AS asset_criticality
+        by src_ip
+    | table
+        severity, src_ip, accounts, sdwan_hosts,
+        first_seen, last_seen, event_count,
+        asset_criticality, attck_technique, rule_id, triage
+    | sort - severity, - event_count

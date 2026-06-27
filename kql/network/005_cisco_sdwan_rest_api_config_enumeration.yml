@@ -1,0 +1,156 @@
+title: Cisco SD-WAN Manager REST API Fabric Configuration Enumeration from Unauthorized IP
+id: 56166ac4-1b77-4016-a88e-f2a8bacfe113
+status: experimental
+description: |
+    Detects access to high-value Cisco Catalyst SD-WAN Manager REST API endpoints from source IPs
+    not in the authorized management IP list. In the documented campaign, the threat actor accessed
+    /dataservice/system/device/vedges, /dataservice/system/device/controllers, and
+    /dataservice/template/config/* to exfiltrate the full SD-WAN fabric configuration.
+
+    Signal tier: T2 — web access logs record all API calls; filter on specific enumeration
+    endpoints from non-management IPs.
+
+author: purple-team
+date: 2026-06-27
+modified: 2026-06-27
+
+tags:
+    - attack.discovery
+    - attack.t1016
+    - attack.collection
+    - attack.t1005
+    - attack.exfiltration
+    - attack.t1041
+
+logsource:
+    product: cisco
+    service: sdwan
+    category: webserver
+
+detection:
+    selection_api_enum:
+        RequestURL|contains:
+            - /dataservice/system/device/vedges
+            - /dataservice/system/device/controllers
+            - /dataservice/template/config/
+        RequestMethod: GET
+        EventResult: Success
+    condition: selection_api_enum
+
+# ── Sentinel metadata ─────────────────────────────────────────────────────────
+platform: sentinel
+rule_type: HuntingQuery
+use_case_id: Network-DET-Cisco-005_cisco_sdwan_rest_api_config_enumeration
+lookback: 15m
+
+prerequisites:
+    - Cisco Catalyst SD-WAN Manager web/nginx access logs forwarded to Sentinel
+    - CommonSecurityLog or custom _CL table receiving SD-WAN web access log events
+    - Admin-Workstations watchlist populated with ALL authorized management IPs
+    - Note: adjust table name below if SD-WAN logs land in a custom _CL table
+
+watchlists:
+    - Vuln-Scanner-IPs
+    - BAS-IPs
+    - Admin-Workstations
+    - High-Value-Assets
+
+falsepositives:
+    - Authorized administrators accessing fabric topology — excluded via Admin-Workstations
+    - SD-WAN monitoring tools polling these endpoints — add IPs to Admin-Workstations
+    - Vulnerability scanners — excluded via Vuln-Scanner-IPs
+
+# medium: REST API access is normal admin activity; depends on Admin-Workstations completeness
+level: medium
+
+tests:
+    - name: External IP accessing SD-WAN device list API
+      event:
+          RequestURL: "/dataservice/system/device/vedges"
+          RequestMethod: GET
+          SourceIP: "126.51.108.152"
+          EventResult: Success
+      expected: match
+
+    - name: Authorized mgmt host accessing API (should not match)
+      event:
+          RequestURL: "/dataservice/system/device/vedges"
+          RequestMethod: GET
+          SourceIP: "10.1.0.5"
+          EventResult: Success
+      expected: no_match
+
+kql_query: |
+    // Use case ID: Network-DET-Cisco-005_cisco_sdwan_rest_api_config_enumeration
+    // ATT&CK:      T1016 — System Network Configuration Discovery
+    //              T1005 — Data from Local System
+    //              T1041 — Exfiltration Over C2 Channel
+    // Severity:    medium (promote to high after management IP baseline validated)
+    // Target:      Sentinel (CommonSecurityLog — adjust if SD-WAN logs in custom _CL table)
+    // Type:        HuntingQuery — promote after Admin-Workstations watchlist validated
+    //
+    // ── Watchlist exclusions ─────────────────────────────────────────────────
+    let ExcludedVulnScanners = toscalar(
+        _GetWatchlist('Vuln-Scanner-IPs') | summarize make_set(SearchKey));
+    let ExcludedBASIPs = toscalar(
+        _GetWatchlist('BAS-IPs') | summarize make_set(SearchKey));
+    let ExcludedMgmtHosts = toscalar(
+        _GetWatchlist('Admin-Workstations') | summarize make_set(SearchKey));
+    let HighValueAssets = toscalar(
+        _GetWatchlist('High-Value-Assets') | summarize make_set(tolower(SearchKey)));
+    //
+    // ── SD-WAN Manager web access log — CommonSecurityLog (CEF format) ────────
+    // Adjust to custom _CL table if SD-WAN logs are not in CEF format.
+    // For plain syslog web access: use Syslog table with appropriate SyslogMessage parse.
+    CommonSecurityLog
+    | where TimeGenerated > ago(15m)
+    | where DeviceVendor contains "Cisco" or DeviceVendor contains "vManage"
+    | where RequestURL has_any (
+        "/dataservice/system/device/vedges",
+        "/dataservice/system/device/controllers",
+        "/dataservice/template/config/")
+    | where RequestMethod == "GET"
+    | where EventOutcome == "200" or EventOutcome == "success"
+    //
+    // ── Exclude RFC1918 source IPs (internal management) ─────────────────────
+    | where not(ipv4_is_private(SourceIP))
+    //
+    // ── Watchlist exclusions ─────────────────────────────────────────────────
+    | where SourceIP !in (ExcludedVulnScanners)
+    | where SourceIP !in (ExcludedBASIPs)
+    | where SourceIP !in (ExcludedMgmtHosts)
+    //
+    // ── Severity graduation ───────────────────────────────────────────────────
+    | extend DeviceName = DeviceName
+    | extend IsCriticalAsset = tolower(DeviceName) in (HighValueAssets)
+    | extend Severity = case(IsCriticalAsset, "High", "Medium")
+    //
+    // ── Rule metadata ─────────────────────────────────────────────────────────
+    | extend
+        ATT_CK = "T1016, T1005, T1041",
+        RuleID = "Network-DET-Cisco-005_cisco_sdwan_rest_api_config_enumeration",
+        Triage = strcat(
+            "1. Verify whether SourceIP is an authorized management host missing from Admin-Workstations. ",
+            "2. If unauthorized: pull all API calls from this IP in the past 24h. ",
+            "3. Check response sizes for /dataservice/template/config/* calls — large responses indicate data was returned. ",
+            "4. Correlate with SSH auth events from same IP (rule 002). ",
+            "5. If unauthorized access confirmed: invoke IR.")
+    //
+    // ── Aggregate by source IP ────────────────────────────────────────────────
+    | summarize
+        FirstSeen           = min(TimeGenerated),
+        LastSeen            = max(TimeGenerated),
+        ApiCallCount        = count(),
+        EndpointsAccessed   = make_set(RequestURL),
+        TotalBytesReturned  = sum(ReceivedBytes),
+        SDWANDevices        = make_set(DeviceName),
+        arg_max(TimeGenerated, *)
+        by SourceIP, RequestClientApplication
+    //
+    // ── Output ────────────────────────────────────────────────────────────────
+    | project
+        Severity, SourceIP, RequestClientApplication,
+        ApiCallCount, EndpointsAccessed, TotalBytesReturned,
+        SDWANDevices, FirstSeen, LastSeen,
+        IsCriticalAsset, ATT_CK, RuleID, Triage
+    | sort by Severity asc, ApiCallCount desc

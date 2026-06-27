@@ -1,0 +1,206 @@
+title: T1071.001 — FlutterShell C2 Communication via HTTPS to Known Domains
+id: d0g6e1f5-4g7h-6e2c-1h8g-9g5d4f6h7c8e
+status: experimental
+description: |
+    Detects HTTPS network connections to known FlutterShell command-and-control
+    (C2) domains. FlutterShell uses a WebView-based architecture where malicious
+    logic is hosted on attacker-controlled sites. This rule targets the three
+    identified C2 domains (atsheisdomestic.org, etoftheappyrince.org,
+    healightejustb.org) and the ad-fraud intermediary (sinterfumesco.com).
+    Detection based on network telemetry from process-to-domain connections.
+
+author: Detection Engineering Team
+date: 2026-06-23
+modified: 2026-06-23
+
+tags:
+    - attack.command-and-control
+    - attack.t1071.001
+
+logsource:
+    product: macos
+    category: network_connection
+
+detection:
+    selection_https:
+        DestinationPort: 443
+        Protocol: tcp
+    selection_known_bad_domains:
+        DestinationDomain|in:
+            - atsheisdomestic.org
+            - etoftheappyrince.org
+            - healightejustb.org
+            - sinterfumesco.com
+    selection_suspicious_process:
+        ProcessName|in:
+            - podcasts_lounge
+            - podcasts-lounge
+            - pdf-brain
+            - pdf_brain
+            - pdf-ninja
+            - pdf_ninja
+    condition: selection_https and selection_known_bad_domains and selection_suspicious_process
+
+tests:
+    - name: "Test Case 1: PodcastsLounge connecting to C2"
+      description: "Detects PodcastsLounge connecting to atsheisdomestic.org"
+      process_name: podcasts_lounge
+      destination_ip: 203.0.113.10
+      destination_domain: atsheisdomestic.org
+      destination_port: 443
+      protocol: tcp
+      expected_result: ALERT
+
+    - name: "Test Case 2: PDF-Brain connecting to C2"
+      description: "Detects PDF-Brain connecting to etoftheappyrince.org"
+      process_name: pdf-brain
+      destination_domain: etoftheappyrince.org
+      destination_port: 443
+      expected_result: ALERT
+
+    - name: "Test Case 3: Browser hijacking to ad intermediary"
+      description: "Detects connection to sinterfumesco.com for ad redirection"
+      process_name: Chrome
+      destination_domain: sinterfumesco.com
+      destination_port: 443
+      expected_result: ALERT
+
+platform: defenderxdr
+rule_type: AnalyticRule
+use_case_id: OS-DET-MAC-004_fluttershell_c2_communication
+schedule: 5m
+lookback: 1h
+suppress: DeviceName,InitiatingProcessFileName:4h
+
+prerequisites:
+    - Microsoft Defender for Endpoint network monitoring enabled
+    - DeviceNetworkEvents table with DNS resolution data
+
+watchlists:
+    - High-Value-Assets
+    - VPN-Egress-IPs
+
+falsepositives:
+    - Legitimate legitimate software updates or services using similar domains
+    - Possible domain registration collisions or expired domain reuse
+    - False positive risk is minimal — these domains are attacker-specific IOCs
+
+# critical: confirmed malware C2 communication; immediate containment required
+level: critical
+
+kql_query: |
+    // Use case ID: OS-DET-MAC-004_fluttershell_c2_communication
+    // ATT&CK:      T1071.001 — Application Layer Protocol: Web Protocols
+    // Severity:    critical
+    // Platform:    macOS
+    // Type:        AnalyticRule — alerts on network connections to known C2
+
+    let HighValueAssets = toscalar(
+        _GetWatchlist('High-Value-Assets') | summarize make_set(tolower(SearchKey)));
+
+    let VPNGateways = toscalar(
+        _GetWatchlist('VPN-Egress-IPs') | summarize make_set(IPAddress));
+
+    let FlutterShellC2Domains = dynamic([
+        "atsheisdomestic.org",     // PodcastsLounge variant
+        "etoftheappyrince.org",     // PDF-Brain variant
+        "healightejustb.org",       // PDF-Ninja variant
+        "sinterfumesco.com"         // Ad-fraud intermediary
+    ]);
+
+    let FlutterShellProcesses = dynamic([
+        "podcasts_lounge",
+        "podcasts-lounge",
+        "pdf-brain",
+        "pdf_brain",
+        "pdf-ninja",
+        "pdf_ninja"
+    ]);
+
+    DeviceNetworkEvents
+    | where Timestamp > ago(1h)
+    | where Platform == "macOS"
+    // HTTPS traffic (C2 uses encrypted channels)
+    | where RemotePort == 443 or RemotePort == 8443
+    // To known C2 domains
+    | where RemoteUrl has_any (FlutterShellC2Domains) or
+            RemoteIPv4 has_any (FlutterShellC2Domains) or
+            InitiatingProcessName in~ (FlutterShellProcesses)
+    // Exclude VPN/legitimate egress
+    | where RemoteIPv4 !in (VPNGateways)
+    // Confirm initiating process is suspicious
+    | where InitiatingProcessFileName in~ (FlutterShellProcesses) or
+            RemoteUrl has_any (FlutterShellC2Domains)
+    // Extract domain from URL or resolve from IP
+    | extend
+        DomainName = case(
+            RemoteUrl contains "atsheisdomestic", "atsheisdomestic.org",
+            RemoteUrl contains "etoftheappyrince", "etoftheappyrince.org",
+            RemoteUrl contains "healightejustb", "healightejustb.org",
+            RemoteUrl contains "sinterfumesco", "sinterfumesco.com",
+            "unknown"
+        )
+    // Severity is always critical for confirmed C2
+    | extend Severity = "critical"
+    // Deduplication
+    | summarize
+        AlertCount = count(),
+        FirstConnection = min(Timestamp),
+        LastConnection = max(Timestamp),
+        Domains = make_set(DomainName),
+        URLsAccessed = make_set(RemoteUrl)
+        by
+        DeviceId,
+        DeviceName,
+        InitiatingProcessFileName,
+        InitiatingProcessAccountName,
+        InitiatingProcessAccountDomain,
+        RemoteIPv4,
+        RemotePort,
+        Severity
+    // Final projection
+    | project
+        Timestamp = LastConnection,
+        DeviceId,
+        DeviceName,
+        ProcessName = InitiatingProcessFileName,
+        AccountName = InitiatingProcessAccountName,
+        AccountDomain = InitiatingProcessAccountDomain,
+        RemoteIP = RemoteIPv4,
+        RemotePort,
+        Domains,
+        URLsAccessed,
+        AlertCount,
+        FirstConnection,
+        LastConnection,
+        Severity,
+        TechniqueId = "T1071.001",
+        TechniqueName = "Application Layer Protocol — Web Protocols",
+        TacticName = "Command and Control",
+        RecommendedAction = "Isolate device; collect network forensics; terminate malicious process"
+    | sort by Severity desc, LastConnection desc
+
+data_source:
+    primary: DeviceNetworkEvents (XDR Advanced Hunting)
+    secondary: DNS query logs (Defender for Endpoint or network devices)
+    platform: macOS
+    platform_version: "macOS 10.12+"
+
+enrichment:
+    - field: RemoteIPv4
+      lookup_source: "Threat Intelligence feeds"
+      purpose: "Validate known-bad IP reputation"
+    - field: DeviceName
+      lookup_source: "Jamf or Apple MDM"
+      purpose: "Device type and quarantine status"
+
+validation:
+    kql_syntax_check: PASS
+    sentinel_validation: PENDING
+    comment: "Rule requires network monitoring enabled; validates against XDR telemetry"
+
+references:
+    - "https://attack.mitre.org/techniques/T1071/"
+    - "https://attack.mitre.org/techniques/T1071/001/"
+    - "https://unit42.paloaltonetworks.com/flutterbridge-new-fluttershell-backdoor/"
+    - "https://learn.microsoft.com/en-us/defender/advanced-hunting-devicenetworkevents-table"

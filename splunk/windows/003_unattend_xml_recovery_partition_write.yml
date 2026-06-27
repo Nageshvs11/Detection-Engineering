@@ -1,0 +1,108 @@
+title: Answer file (unattend.xml) written to a recovery/boot volume by a non-provisioning process
+id: 1a4f8c6d-2e57-4b90-9c3a-7d610b2e8f21
+status: experimental
+description: |
+    Detects creation of an `unattend.xml` answer file (or a Recovery\WindowsRE directory) on a
+    drive root / recovery volume via Sysmon FileCreate (EID 11), outside the standard provisioning
+    paths. This is the only on-host observable of the GreatXML BitLocker bypass (T1542) — the
+    attacker plants a malicious unattend.xml + modified WinRE components at the recovery partition
+    root for WinRE to execute on the next offline-scan boot.
+author: purple-team
+date: 2026-06-15
+modified: 2026-06-15
+
+tags:
+    - attack.persistence
+    - attack.t1542
+    - attack.t1542.003
+
+logsource:
+    product: windows
+    category: file_event
+    service: sysmon
+
+detection:
+    selection:
+        EventCode: 11
+        TargetFilename|endswith: '\unattend.xml'
+    filter_provisioning:
+        TargetFilename|contains:
+            - '\Windows\Panther\'
+            - '\Windows\System32\Sysprep\'
+    condition: selection and not filter_provisioning
+
+platform: splunk
+rule_type: CorrelationSearch
+use_case_id: OS-DET-WIN-003_unattend_xml_recovery_partition_write
+index: "*-os-win"
+sourcetype: "XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+schedule: "*/10 * * * *"
+lookback: 1h
+suppress: Computer:4h
+
+prerequisites:
+    - Sysmon with FileCreate (EID 11) configured to include .xml on removable/fixed volumes
+    - "Lab note: rule declares the portable index=*-os-win; validate against the lab's flat index=windows"
+
+lookups:
+    - sanctioned_tools.csv
+    - admin_workstations.csv
+    - high_value_assets.csv
+
+falsepositives:
+    - OS imaging / provisioning (Sysprep, MDT/SCCM, OEM imaging) writing unattend.xml to the
+      Panther/Sysprep paths — excluded by filter_provisioning
+    - Approved deployment tooling on build hosts — excluded via sanctioned_tools.csv /
+      admin_workstations.csv; tune for the imaging fleet
+
+# high: answer file written to a recovery/boot volume outside provisioning paths has no legitimate
+# use and is the plant stage of a BitLocker bypass; graduates to critical on a high-value asset.
+level: high
+
+spl_query: |
+    `comment("Use case ID: OS-DET-WIN-003_unattend_xml_recovery_partition_write")`
+    `comment("ATT&CK:      T1542 / T1542.003 — Pre-OS Boot (WinRE answer-file abuse, GreatXML)")`
+    `comment("Severity:    high")`
+    `comment("Type:        CorrelationSearch")`
+    index="*-os-win" sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+        EventCode=11 TargetFilename="*\\unattend.xml"
+        earliest=-1h latest=now
+    NOT (TargetFilename="*\\Windows\\Panther\\*" OR TargetFilename="*\\Windows\\System32\\Sysprep\\*")
+    NOT [| inputlookup sanctioned_tools.csv | rename process_name AS Image | table Image]
+    NOT [| inputlookup admin_workstations.csv | rename hostname AS Computer | table Computer]
+    | lookup high_value_assets.csv hostname AS Computer OUTPUT criticality AS asset_criticality
+    | eval severity = if(asset_criticality="critical", "critical", "high")
+    | eval attck_technique="T1542.003",
+           rule_id="OS-DET-WIN-003_unattend_xml_recovery_partition_write",
+           triage="1. Confirm path is a recovery/boot volume root. 2. Hash the file vs IOC 785CCFA8...90389. 3. Check for modified Recovery\\WindowsRE. 4. Isolate; survives credential rotation."
+    | stats min(_time) AS first_seen max(_time) AS last_seen count AS event_count
+            values(TargetFilename) AS files values(Image) AS initiating_process latest(severity) AS severity
+        by Computer, User
+    | eval attck_technique="T1542.003", rule_id="OS-DET-WIN-003_unattend_xml_recovery_partition_write"
+    | table severity, Computer, User, files, initiating_process,
+            first_seen, last_seen, event_count, attck_technique, rule_id
+    | sort - severity, - event_count
+
+tests:
+    - name: Sysmon EID 11 unattend.xml written to a non-provisioning drive root (must alert)
+      log_source:
+          product: windows
+          service: sysmon
+      event:
+          EventCode: 11
+          TargetFilename: 'R:\unattend.xml'
+          Image: 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+      expected: match
+    - name: Sysprep writes unattend.xml to Panther provisioning path (must not alert)
+      log_source:
+          product: windows
+          service: sysmon
+      event:
+          EventCode: 11
+          TargetFilename: 'C:\Windows\Panther\unattend.xml'
+          Image: 'C:\Windows\System32\dism.exe'
+      expected: no_match
+
+references:
+    - https://attack.mitre.org/techniques/T1542/003/
+    - https://www.cyderes.com/howler-cell/greatxml-windows-zero-day

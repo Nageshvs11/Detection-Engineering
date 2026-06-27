@@ -1,0 +1,150 @@
+title: Cisco SD-WAN Manager CVE-2026-20245 Tenant Upload Exploit
+id: f5d768f1-6ca1-47dc-8a43-f12becdad7ca
+status: experimental
+description: |
+    Detects exploitation of CVE-2026-20245 — a privilege-escalation zero-day in Cisco Catalyst
+    SD-WAN Manager's CLI file-upload feature. The exploit works by supplying a crafted CSV file
+    to the `request tenant-upload tenant-list <path> vpn 0` CLI command. This causes
+    `vconfd_script_upload_tenant_list.sh` to execute attacker-controlled shell payloads as root.
+    Legitimate provisioning only ever supplies paths under /etc/viptela/ or /usr/share/viptela/;
+    any other path is either a misconfiguration or exploitation.
+
+    Signal tier: T1 — the script invocation is the exploit trigger itself; filtering on paths
+    outside provisioning directories makes this near-binary.
+
+    Evasion: attacker could stage file in /etc/viptela/ if they have write access there (requires
+    pre-existing root, making CVE-2026-20245 unnecessary). Path outside these directories is
+    practically always exploitation.
+
+author: purple-team
+date: 2026-06-27
+modified: 2026-06-27
+
+tags:
+    - attack.privilege_escalation
+    - attack.t1068
+    - attack.execution
+    - attack.t1059.004
+
+logsource:
+    product: cisco
+    service: sdwan
+    category: application
+
+detection:
+    selection_script:
+        process: vScript
+        message|contains: vconfd_script_upload_tenant_list.sh
+    filter_legit_paths:
+        message|contains:
+            - /etc/viptela/
+            - /usr/share/viptela/
+            - /var/run/viptela/
+    condition: selection_script and not filter_legit_paths
+
+# ── Splunk metadata ────────────────────────────────────────────────────────────
+platform: splunk
+rule_type: CorrelationSearch
+use_case_id: Network-DET-Cisco-001_cisco_sdwan_cve_2026_20245_tenant_upload
+index: "*-network"
+sourcetype: syslog
+schedule: "*/5 * * * *"
+lookback: 1h
+suppress: host:4h
+
+prerequisites:
+    - Cisco Catalyst SD-WAN Manager syslog (/var/log/scripts.log) forwarded to Splunk
+    - index="*-network" sourcetype=syslog receiving vManage syslog
+    - Verify: index="*-network" "vconfd_script_upload_tenant_list" | head 5
+
+# Exclusion justifications:
+#   vpn_egress_ips.csv      — N/A: this is local script execution, no network source IP
+#   vuln_scanner_ips.csv    — N/A: no network source IP in this log event
+#   bas_ips.csv             — N/A: cannot correlate SSH source to local script execution;
+#                             BAS-triggered exploitation in steady-state is extremely unlikely
+#   service_accounts.csv    — N/A: no account field in this log event
+#   admin_workstations.csv  — N/A: no host field to correlate
+#   sanctioned_tools.csv    — N/A: this is not process execution from endpoint
+lookups:
+    - high_value_assets.csv
+
+falsepositives:
+    - No legitimate use case identified for supplying a path outside /etc/viptela/,
+      /usr/share/viptela/, or /var/run/viptela/ to this command. Any match should be
+      treated as critical until proven otherwise.
+    - BAS tools exercising CVE-2026-20245 during an approved simulation exercise — tag
+      the exercise window and review; do not permanently exclude via lookup.
+
+# critical: this behavior has no known legitimate use outside of patched provisioning paths;
+# direct path to root on the SD-WAN control plane
+level: critical
+
+validation:
+    status: NO-DATA
+    reason: source-silent — lab environment contains Windows endpoint telemetry only;
+            no Cisco SD-WAN Manager syslog forwarded to index=windows or any *-network index.
+            Splunk credentials also not configured in this session.
+    lab_query: index="*-network" "vconfd_script_upload_tenant_list" | head 5
+    prod_query: index="*-network" sourcetype=syslog "vconfd_script_upload_tenant_list.sh"
+                earliest=-24h | head 5
+
+tests:
+    - name: CVE-2026-20245 — evil_tenant.csv exploit via request tenant-upload
+      log_source:
+          product: cisco
+          service: sdwan
+      event:
+          _raw: "Jan 01 08:01:05 vManage vScript: Tenant list upload per vsmart serial number: /usr/bin/vconfd_script_upload_tenant_list.sh -cli path /home/admin/evil_tenant.csv vpn 0"
+          host: vManage
+          sourcetype: syslog
+      expected: match
+
+    - name: Legitimate provisioning — path under /etc/viptela/ (should not match)
+      log_source:
+          product: cisco
+          service: sdwan
+      event:
+          _raw: "Jan 01 09:00:00 vManage vScript: Tenant list upload per vsmart serial number: /usr/bin/vconfd_script_upload_tenant_list.sh -cli path /etc/viptela/tenant_list.csv vpn 0"
+          host: vManage
+          sourcetype: syslog
+      expected: no_match
+
+spl_query: |
+    index="*-network" sourcetype=syslog
+        earliest=-1h latest=now
+        "vconfd_script_upload_tenant_list.sh"
+    `comment("── Filter: exclude legitimate provisioning paths ──────────────────────")`
+    | where NOT match(_raw,
+        "(?:/etc/viptela/|/usr/share/viptela/|/var/run/viptela/)")
+    `comment("── Extract context fields ─────────────────────────────────────────────")`
+    | rex field=_raw
+        "^(?:[A-Z][a-z]{2}\s+\d+\s+[\d:]+)\s+(?P<sdwan_host>\S+)\s+vScript:\s+(?P<vscript_message>.+)$"
+    | rex field=_raw
+        "vconfd_script_upload_tenant_list\.sh\s+(?:\S+\s+)*path\s+(?P<upload_path>\S+)\s+vpn\s+(?P<vpn_id>\d+)"
+    `comment("── Severity graduation — high-value asset lookup ──────────────────────")`
+    | lookup high_value_assets.csv hostname AS sdwan_host
+        OUTPUT criticality AS asset_criticality
+    | eval severity = "critical"
+    `comment("── Rule metadata ──────────────────────────────────────────────────────")`
+    | eval
+        attck_technique = "T1068,T1059.004",
+        rule_id         = "Network-DET-Cisco-001_cisco_sdwan_cve_2026_20245_tenant_upload",
+        triage          = "1. Immediately isolate the SD-WAN Manager from the network. 2. Check /etc/passwd for unauthorized UID 0 accounts (grep '^.*:x:0:' /etc/passwd). 3. Run 'show history' in vManage CLI and collect /var/log/scripts.log and /var/log/auth.log. 4. Engage Cisco TAC per advisory cisco-sa-sdwan-privesc-4uxFrdzx. 5. Cross-reference source IP against known IOCs: 126.51.108.152."
+    `comment("── Deduplicate — one alert per SD-WAN device per hour ────────────────")`
+    | stats
+        min(_time)               AS first_seen
+        max(_time)               AS last_seen
+        count                    AS event_count
+        values(upload_path)      AS upload_paths
+        latest(sdwan_host)       AS sdwan_host
+        latest(severity)         AS severity
+        latest(attck_technique)  AS attck_technique
+        latest(rule_id)          AS rule_id
+        latest(triage)           AS triage
+        latest(asset_criticality) AS asset_criticality
+        by host
+    | table
+        severity, host, sdwan_host, upload_paths,
+        first_seen, last_seen, event_count,
+        asset_criticality, attck_technique, rule_id, triage
+    | sort - severity, - event_count

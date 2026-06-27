@@ -1,0 +1,138 @@
+title: Cisco SD-WAN Manager CVE-2026-20245 Tenant Upload Exploit
+id: 89202def-8435-4ac1-b10b-e5ce74d680c6
+status: experimental
+description: |
+    Detects exploitation of CVE-2026-20245 — a privilege-escalation zero-day in Cisco Catalyst
+    SD-WAN Manager's CLI file-upload feature. The exploit works by supplying a crafted CSV file
+    to the `request tenant-upload tenant-list <path> vpn 0` CLI command, causing
+    `vconfd_script_upload_tenant_list.sh` to execute attacker-controlled shell payloads as root.
+    Legitimate provisioning only ever supplies paths under /etc/viptela/ or /usr/share/viptela/.
+
+    Signal tier: T1 — the script invocation is the exploit trigger; filtering on paths outside
+    provisioning directories makes this near-binary.
+
+author: purple-team
+date: 2026-06-27
+modified: 2026-06-27
+
+tags:
+    - attack.privilege_escalation
+    - attack.t1068
+    - attack.execution
+    - attack.t1059.004
+
+logsource:
+    product: cisco
+    service: sdwan
+    category: application
+
+detection:
+    selection_script:
+        ProcessName: vScript
+        SyslogMessage|contains: vconfd_script_upload_tenant_list.sh
+    filter_legit_paths:
+        SyslogMessage|contains:
+            - /etc/viptela/
+            - /usr/share/viptela/
+            - /var/run/viptela/
+    condition: selection_script and not filter_legit_paths
+
+# ── Sentinel metadata ─────────────────────────────────────────────────────────
+platform: sentinel
+rule_type: AnalyticRule
+use_case_id: Network-DET-Cisco-001_cisco_sdwan_cve_2026_20245_tenant_upload
+schedule: 5m
+lookback: 1h
+suppress: HostName:4h
+
+prerequisites:
+    - Cisco Catalyst SD-WAN Manager syslog forwarded to Log Analytics via AMA or syslog forwarder
+    - Syslog table receiving vManage syslog (ProcessName = "vScript")
+    - Target console: Sentinel (Syslog table)
+
+watchlists:
+    - High-Value-Assets
+
+falsepositives:
+    - No legitimate use case identified for a path outside /etc/viptela/, /usr/share/viptela/,
+      or /var/run/viptela/. Every match should be treated as critical until proven otherwise.
+    - BAS tools running a CVE-2026-20245 simulation exercise — review time-windowed suppression.
+
+# critical: zero legitimate use; direct path to root on the SD-WAN control-plane device
+level: critical
+
+tests:
+    - name: CVE-2026-20245 exploit — evil_tenant.csv in /home/admin/
+      log_source:
+          product: cisco
+          service: sdwan
+      event:
+          ProcessName: vScript
+          SyslogMessage: "Tenant list upload per vsmart serial number: /usr/bin/vconfd_script_upload_tenant_list.sh -cli path /home/admin/evil_tenant.csv vpn 0"
+          HostName: vManage
+      expected: match
+
+    - name: Legitimate provisioning under /etc/viptela/ (should not match)
+      log_source:
+          product: cisco
+          service: sdwan
+      event:
+          ProcessName: vScript
+          SyslogMessage: "Tenant list upload per vsmart serial number: /usr/bin/vconfd_script_upload_tenant_list.sh -cli path /etc/viptela/tenant_list.csv vpn 0"
+          HostName: vManage
+      expected: no_match
+
+kql_query: |
+    // Use case ID: Network-DET-Cisco-001_cisco_sdwan_cve_2026_20245_tenant_upload
+    // ATT&CK:      T1068 — Exploitation for Privilege Escalation
+    //              T1059.004 — Unix Shell
+    // Severity:    critical
+    // Target:      Sentinel (Syslog table)
+    // Prereq:      Cisco SD-WAN Manager syslog forwarded to Sentinel
+    //
+    // ── Watchlist: high-value assets (severity graduation) ───────────────────
+    let HighValueAssets = toscalar(
+        _GetWatchlist('High-Value-Assets') | summarize make_set(tolower(SearchKey)));
+    //
+    // ── Base query: vScript log containing exploit script ────────────────────
+    Syslog
+    | where TimeGenerated > ago(1h)
+    | where ProcessName == "vScript"
+    | where SyslogMessage contains "vconfd_script_upload_tenant_list.sh"
+    // Exclude legitimate provisioning paths
+    | where not(SyslogMessage has_any ("/etc/viptela/", "/usr/share/viptela/", "/var/run/viptela/"))
+    //
+    // ── Extract the attacker-controlled file path ─────────────────────────────
+    | parse SyslogMessage with * "path " UploadPath " vpn " VpnId
+    //
+    // ── Severity graduation ───────────────────────────────────────────────────
+    | extend IsCriticalAsset = tolower(HostName) in (HighValueAssets)
+    | extend Severity = "Critical"   // always Critical — zero legitimate use
+    //
+    // ── Rule metadata ─────────────────────────────────────────────────────────
+    | extend
+        ATT_CK  = "T1068, T1059.004",
+        RuleID  = "Network-DET-Cisco-001_cisco_sdwan_cve_2026_20245_tenant_upload",
+        Triage  = strcat(
+            "1. Immediately isolate the SD-WAN Manager. ",
+            "2. Check /etc/passwd for UID 0 accounts: grep '^.*:x:0:' /etc/passwd. ",
+            "3. Collect /var/log/scripts.log, /var/log/auth.log, and run 'show history'. ",
+            "4. Engage Cisco TAC per advisory cisco-sa-sdwan-privesc-4uxFrdzx. ",
+            "5. Cross-reference source IP against known IOC: 126.51.108[.]152.")
+    //
+    // ── Deduplicate — one alert row per SD-WAN device ────────────────────────
+    | summarize
+        FirstSeen    = min(TimeGenerated),
+        LastSeen     = max(TimeGenerated),
+        EventCount   = count(),
+        UploadPaths  = make_set(UploadPath),
+        arg_max(TimeGenerated, *)
+        by HostName
+    //
+    // ── Output ────────────────────────────────────────────────────────────────
+    | project
+        Severity, HostName, Computer,
+        UploadPaths, VpnId,
+        FirstSeen, LastSeen, EventCount,
+        IsCriticalAsset, ATT_CK, RuleID, Triage
+    | sort by Severity asc, LastSeen desc

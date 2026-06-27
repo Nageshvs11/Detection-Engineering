@@ -1,0 +1,130 @@
+title: Cisco SD-WAN Manager Successful su to Non-Standard Root-Equivalent Account
+id: 49bc7201-8e2f-4043-a535-59b566690e31
+status: experimental
+description: |
+    Detects a successful `su` command from the admin account to a non-standard account on a Cisco
+    Catalyst SD-WAN Manager device. In the documented campaign, the threat actor created a `troot`
+    account with UID 0 via CVE-2026-20245, then issued `su troot` from the admin shell.
+
+    Signal tier: T2 — auth.log `Successful su for [account] by admin` is unavoidably logged.
+    On SD-WAN Manager, admin should never need to su to any account other than root (TAC sessions).
+
+author: purple-team
+date: 2026-06-27
+modified: 2026-06-27
+
+tags:
+    - attack.privilege_escalation
+    - attack.t1068
+    - attack.persistence
+    - attack.t1136.001
+
+logsource:
+    product: linux
+    service: auth
+    category: authentication
+
+detection:
+    selection_su_success:
+        ProcessName|startswith: su
+        SyslogMessage|contains|all:
+            - Successful su for
+            - by admin
+    filter_expected_root:
+        SyslogMessage|contains: Successful su for root by admin
+    condition: selection_su_success and not filter_expected_root
+
+# ── Sentinel metadata ─────────────────────────────────────────────────────────
+platform: sentinel
+rule_type: AnalyticRule
+use_case_id: Network-DET-Cisco-003_cisco_sdwan_su_to_root_equiv_account
+schedule: 5m
+lookback: 1h
+suppress: SuTarget:4h
+
+prerequisites:
+    - Cisco Catalyst SD-WAN Manager syslog (/var/log/auth.log) forwarded to Sentinel
+    - Syslog table receiving vManage auth.log events
+
+watchlists:
+    - High-Value-Assets
+
+falsepositives:
+    - Authorized Cisco TAC debugging sessions where admin su's to root (filtered by
+      filter_expected_root condition)
+    - If organization authorizes su to other named accounts on SD-WAN Manager, add
+      those account names to the filter condition
+
+# critical: admin su to any non-root account is near-binary; zero legitimate steady-state use
+level: critical
+
+tests:
+    - name: Successful su to troot by admin (post-exploit root access)
+      event:
+          ProcessName: su
+          SyslogMessage: "Successful su for troot by admin"
+          HostName: vManage
+      expected: match
+
+    - name: Successful su to root (authorized TAC session — should not match)
+      event:
+          ProcessName: su
+          SyslogMessage: "Successful su for root by admin"
+          HostName: vManage
+      expected: no_match
+
+kql_query: |
+    // Use case ID: Network-DET-Cisco-003_cisco_sdwan_su_to_root_equiv_account
+    // ATT&CK:      T1068 — Exploitation for Privilege Escalation
+    //              T1136.001 — Create Account: Local Account
+    // Severity:    critical
+    // Target:      Sentinel (Syslog table)
+    //
+    // ── Watchlist ─────────────────────────────────────────────────────────────
+    let HighValueAssets = toscalar(
+        _GetWatchlist('High-Value-Assets') | summarize make_set(tolower(SearchKey)));
+    //
+    // ── Base query ────────────────────────────────────────────────────────────
+    Syslog
+    | where TimeGenerated > ago(1h)
+    | where ProcessName startswith "su"
+    | where SyslogMessage contains "Successful su for"
+          and SyslogMessage contains "by admin"
+    // Exclude TAC-authorized su to root
+    | where not(SyslogMessage contains "Successful su for root by admin")
+    //
+    // ── Extract the su target account ─────────────────────────────────────────
+    | parse SyslogMessage with "Successful su for " SuTarget " by admin"
+    //
+    // ── Severity graduation ───────────────────────────────────────────────────
+    | extend IsCriticalAsset = tolower(HostName) in (HighValueAssets)
+    | extend Severity = "Critical"   // always Critical — zero legitimate steady-state use
+    //
+    // ── Rule metadata ─────────────────────────────────────────────────────────
+    | extend
+        ATT_CK = "T1068, T1136.001",
+        RuleID = "Network-DET-Cisco-003_cisco_sdwan_su_to_root_equiv_account",
+        Triage = strcat(
+            "1. CRITICAL: check /etc/passwd for unauthorized UID 0 accounts: ",
+            "grep '^.*:x:0:' /etc/passwd. ",
+            "2. Check auth.log for admin activity in preceding 30 min — look for ",
+            "vScript events (rule 001) and SSH from external IP (rule 002). ",
+            "3. If rogue UID 0 account found: device is fully compromised. ",
+            "4. Engage Cisco TAC and isolate the SD-WAN Manager immediately. ",
+            "5. Do not reboot without first collecting forensic data.")
+    //
+    // ── Deduplicate ───────────────────────────────────────────────────────────
+    | summarize
+        FirstSeen   = min(TimeGenerated),
+        LastSeen    = max(TimeGenerated),
+        EventCount  = count(),
+        SDWANHosts  = make_set(HostName),
+        arg_max(TimeGenerated, *)
+        by SuTarget
+    //
+    // ── Output ────────────────────────────────────────────────────────────────
+    | project
+        Severity, SuTarget, SDWANHosts,
+        FirstSeen, LastSeen, EventCount,
+        IsCriticalAsset, ATT_CK, RuleID, Triage
+    | sort by Severity asc, LastSeen desc

@@ -1,0 +1,2 @@
+hostname,ip,description,last_updated
+PAW-EXAMPLE01,10.0.0.10,EXAMPLE - replace with a real PAW / jump host / bastion,2026-06-15
