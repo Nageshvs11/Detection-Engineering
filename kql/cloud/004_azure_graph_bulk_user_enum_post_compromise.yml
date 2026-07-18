@@ -1,0 +1,69 @@
+title: Azure Post-Compromise Graph Bulk User Enumeration with Az Identity Check
+id: c3d4e5f6-a7b8-9012-cdef-345678901234
+status: stable
+description: |
+  Detects Microsoft Graph API calls that enumerate the full tenant user list
+  (a request to the /users endpoint with a $select projection) occurring
+  within a rolling window of an Az PowerShell/CLI identity check
+  (Connect-AzAccount followed by Get-AzADUser -SignedIn or a subscription
+  read), correlated by source IP. This combination is characteristic of an
+  attacker confirming a newly compromised identity and immediately
+  enumerating the tenant's user population.
+author: Detection KB
+date: 2026-07-18
+modified: 2026-07-18
+
+tags:
+- attack.discovery
+- attack.t1087.004
+- attack.collection
+
+logsource:
+  product: azure
+  service: graph_activity_logs
+
+detection:
+  selection:
+    RequestUri|contains: '/users'
+    RequestUri|contains: '\$select'
+    ResponseStatusCode: 200
+  correlation:
+    table: AzureActivity
+    join_field: IPAddress
+    window: 60m
+  condition: selection and correlation
+
+platform: sentinel
+rule_type: HuntingQuery
+use_case_id: Cloud-DET-Azure-004_graph_bulk_user_enum_post_compromise
+schedule: 15m
+lookback: 2h
+suppress: IPAddress:4h
+
+prerequisites:
+- Microsoft Graph Activity Logs data connector enabled and ingested (MicrosoftGraphActivityLogs)
+- AzureActivity diagnostic logs ingested to the same workspace
+
+watchlists:
+- Service-Accounts
+- Sanctioned-Apps
+
+falsepositives:
+- HR, IT provisioning, or directory-sync tools that legitimately bulk-query user attributes
+- Security/asset-management tooling that both queries Graph and checks Az identity from the same automation IP - mitigated by Sanctioned-Apps watchlist
+
+level: medium
+
+kql_query: |
+  let graphEnum = MicrosoftGraphActivityLogs
+  | where RequestUri has "/users" and RequestUri has "$select"
+  | where ResponseStatusCode == 200
+  | project TimeGenerated, IPAddress, UserId;
+  let azWhoAmI = AzureActivity
+  | where Authorization has "Az" or OperationNameValue has "SUBSCRIPTIONS/READ"
+  | project TimeGenerated2 = TimeGenerated, CallerIpAddress, Caller;
+  graphEnum
+  | join kind=inner azWhoAmI on $left.IPAddress == $right.CallerIpAddress
+  | where abs(datetime_diff('minute', TimeGenerated, TimeGenerated2)) < 60
+  | project TimeGenerated, UserId, IPAddress, Caller
+  | order by TimeGenerated desc
