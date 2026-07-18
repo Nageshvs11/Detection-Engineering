@@ -7,7 +7,7 @@ description: |
   download of a specific (often stale/deleted) blob version. Correlates
   all three stages by source IP address to distinguish a deliberate
   recon-to-exfiltration chain from isolated, benign anonymous reads.
-author: Detection KB
+author: Nagesh
 date: 2026-07-18
 modified: 2026-07-18
 
