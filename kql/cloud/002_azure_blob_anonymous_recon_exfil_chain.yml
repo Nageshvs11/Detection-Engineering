@@ -1,0 +1,70 @@
+title: Azure Blob Anonymous Recon-to-Exfiltration Chain
+id: a1b2c3d4-e5f6-7890-abcd-ef1234567890
+status: stable
+description: |
+  Detects an anonymous caller against an Azure Blob Storage container
+  progressing through container listing, blob version enumeration, and
+  download of a specific (often stale/deleted) blob version. Correlates
+  all three stages by source IP address to distinguish a deliberate
+  recon-to-exfiltration chain from isolated, benign anonymous reads.
+author: Detection KB
+date: 2026-07-18
+modified: 2026-07-18
+
+tags:
+- attack.reconnaissance
+- attack.t1619
+- attack.collection
+- attack.t1530
+
+logsource:
+  product: azure
+  service: storage_blob_logs
+
+detection:
+  selection:
+    AuthenticationType: Anonymous
+    OperationName:
+    - ListBlobs
+    - GetBlob
+  condition: selection | correlate by CallerIpAddress across stages
+
+platform: sentinel
+rule_type: HuntingQuery
+use_case_id: Cloud-DET-Azure-002_blob_anonymous_recon_exfil_chain
+schedule: 15m
+lookback: 1d
+suppress: CallerIpAddress:4h
+
+prerequisites:
+- Storage account diagnostic settings configured to send StorageBlobLogs to Log Analytics
+- $web or other publicly-readable containers should be reviewed for necessity
+
+watchlists:
+- VPN-Egress-IPs
+- Vuln-Scanner-IPs
+- BAS-IPs
+
+falsepositives:
+- Legitimate CDN, crawler, or monitoring services enumerating public static-website containers
+- Vulnerability scanners or security assessment tools testing public storage endpoints - mitigated by Vuln-Scanner-IPs/BAS-IPs watchlists
+- Automated backup/versioning audits performed by the account owner's own tooling from a known IP
+
+level: medium-high
+
+kql_query: |
+  StorageBlobLogs
+  | where AuthenticationType == "Anonymous"
+  | extend Stage = case(
+      OperationName == "ListBlobs" and Uri has "versions", "2_VersionEnumeration",
+      OperationName == "ListBlobs", "1_ContainerListing",
+      OperationName == "GetBlob" and (Uri has "versionid" or Uri has "versionId"), "3_VersionedBlobDownload",
+      "")
+  | where Stage != ""
+  | summarize Stages = make_set(Stage), StageCount = dcount(Stage),
+              FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated),
+              Uris = make_set(Uri)
+      by CallerIpAddress, AccountName
+  | where StageCount >= 2
+  | extend FullChainDetected = StageCount == 3
+  | order by FullChainDetected desc, LastSeen desc
