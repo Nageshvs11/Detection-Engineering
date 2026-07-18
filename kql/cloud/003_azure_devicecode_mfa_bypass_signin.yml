@@ -1,0 +1,68 @@
+title: Azure Device-Code Sign-in with External Authentication Method MFA Satisfaction
+id: b2c3d4e5-f6a7-8901-bcde-f23456789012
+status: stable
+description: |
+  Detects sign-ins using the OAuth device-code flow (commonly leveraged with
+  the public Azure PowerShell/CLI client ID) where MFA was satisfied through
+  an External Authentication Method rather than a standard method, within the
+  same authentication session (CorrelationId). This pattern can indicate
+  abuse of a compromised or misconfigured External Authentication Provider
+  that auto-approves MFA challenges, satisfying Conditional Access policies
+  that require the standalone-MFA grant control.
+author: Detection KB
+date: 2026-07-18
+modified: 2026-07-18
+
+tags:
+- attack.initial_access
+- attack.t1078
+- attack.defense_evasion
+- attack.t1556
+
+logsource:
+  product: azure
+  service: sign_in_logs
+
+detection:
+  selection:
+    AppId: 04b07795-8ddb-461a-bbee-02f9e1bf7b46
+    AuthenticationProtocol: deviceCode
+  filter:
+    AuthenticationDetails.authenticationMethod: "External Authentication Method"
+  condition: selection and filter joined by CorrelationId
+
+platform: sentinel
+rule_type: HuntingQuery
+use_case_id: Cloud-DET-Azure-003_devicecode_mfa_bypass_signin
+schedule: 5m
+lookback: 1h
+suppress: UserPrincipalName:1h
+
+prerequisites:
+- Microsoft Entra ID data connector; SigninLogs table populated with AuthenticationDetails
+- Review of any custom External Authentication Methods/Providers configured in the tenant
+
+watchlists:
+- Service-Accounts
+- High-Value-Assets
+
+falsepositives:
+- Legitimate use of device-code flow for headless/CLI scenarios combined with a correctly functioning external MFA provider
+- Break-glass or emergency access accounts intentionally configured with alternate authentication methods
+
+level: high
+
+kql_query: |
+  let deviceCodeSignins = SigninLogs
+  | where AppId == "04b07795-8ddb-461a-bbee-02f9e1bf7b46" // Azure PowerShell public client
+  | where AuthenticationProtocol == "deviceCode" or AuthenticationRequirement != ""
+  | project TimeGenerated, UserPrincipalName, IPAddress, Location, CorrelationId;
+  let externalMfaSignins = SigninLogs
+  | mv-expand AuthDetail = parse_json(AuthenticationDetails)
+  | where tostring(AuthDetail.authenticationMethod) has "External Authentication Method"
+      or tostring(AuthDetail.authenticationStepResultDetail) has "external"
+  | project UserPrincipalName, CorrelationId;
+  deviceCodeSignins
+  | join kind=inner externalMfaSignins on UserPrincipalName, CorrelationId
+  | project TimeGenerated, UserPrincipalName, IPAddress, Location
+  | order by TimeGenerated desc
