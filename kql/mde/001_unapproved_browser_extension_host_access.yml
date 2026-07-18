@@ -1,0 +1,56 @@
+title: Unapproved Browser Extension Requesting Host Access to AI Assistant Domains (Claude Extension Trust-Bypass Exposure)
+id: 21042398-7eb7-502c-9370-be59240bf195
+status: stable
+description: |
+  This rule detects the installation of browser extensions that request host permissions for major AI services (Claude, ChatGPT, Gemini, Copilot). It filters out pre-approved extension IDs to highlight potentially unauthorized or malicious extensions that may be used to intercept sensitive user interactions, prompts, or AI-generated data.
+  author: Detection KB
+  date: 2026-07-18
+  modified: 2026-07-18
+
+  tags:
+    - attack.persistence
+      - attack.t1176
+
+      logsource:
+        product: windows
+          service: mde_device_events
+
+          detection:
+            selection:
+                ActionType: BrowserExtensionInstallationEvent
+                  condition: selection
+
+                  platform: mde
+                  rule_type: AnalyticRule
+                  use_case_id: MDE-DET-Windows-001_unapproved_browser_extension_host_access
+
+                  prerequisites:
+                    - Microsoft Defender for Endpoint (MDE) onboarded; DeviceEvents table present in advanced hunting
+                      - AllowlistedExtensionIds populated with org-approved extension IDs (watchlist or dynamic array) before deployment
+
+                      falsepositives:
+                        - Legitimate/approved AI-assistant browser extensions not yet added to the allowlist
+                          - IT-deployed extensions rolled out via GPO/Intune that legitimately request broad host permissions for integration purposes
+
+                          level: medium
+
+                          kql_query: |
+                            // Note: AllowlistedExtensionIds is a placeholder dynamic array/watchlist.
+                              // Each organization must populate this with their own approved extension IDs
+                                // (e.g. via a watchlist join or a let-defined dynamic array) before deploying this rule.
+                                  let AllowlistedExtensionIds = dynamic([]);
+                                    DeviceEvents
+                                      | where ActionType == "BrowserExtensionInstallationEvent"
+                                        | extend ExtParsed = parse_json(AdditionalFields)
+                                          | extend ExtensionId = tostring(ExtParsed.extensionId),
+                                                     ExtensionName = tostring(ExtParsed.name),
+                                                                HostPermissions = tostring(ExtParsed.hostPermissions),
+                                                                           Permissions = tostring(ExtParsed.permissions)
+                                                                             | where HostPermissions has_any ("claude.ai", "chatgpt.com", "gemini.google.com", "copilot.microsoft.com")
+                                                                               | where ExtensionId !in (AllowlistedExtensionIds)
+                                                                                 | project TimeGenerated, DeviceName, AccountName, ExtensionId, ExtensionName, HostPermissions, Permissions
+
+                                                                                 references:
+                                                                                   - "ClaudeBleed Reopened: Browser Extensions Can Still Push Claude for Chrome to Read Your Gmail - Manifold Security"
+                                                                                     - "DeviceEvents table in the advanced hunting schema - Microsoft Defender XDR | Microsoft Learn"
+                                                                                     
