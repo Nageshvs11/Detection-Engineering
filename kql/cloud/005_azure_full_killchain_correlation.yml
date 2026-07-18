@@ -1,0 +1,92 @@
+title: Azure Full Kill-Chain Correlation - Blob Recon to Tenant Enumeration
+id: d4e5f6a7-b8c9-0123-defa-456789012345
+status: stable
+description: |
+  Master correlation rule that normalizes StorageBlobLogs, SigninLogs,
+  MicrosoftGraphActivityLogs, and AzureActivity into a common schema and
+  flags any single actor (by source IP) observed across three or more
+  stages of the attack chain: anonymous blob container/version
+  enumeration, versioned blob download, device-code sign-in, and
+  post-compromise Graph/Az enumeration. Intended as a high-confidence,
+  end-to-end detection of the full attack path rather than isolated steps.
+author: Detection KB
+date: 2026-07-18
+modified: 2026-07-18
+
+tags:
+- attack.initial_access
+- attack.reconnaissance
+- attack.discovery
+- attack.t1078
+- attack.t1619
+
+logsource:
+  product: azure
+  service: multi_source
+
+detection:
+  selection:
+    sources:
+    - StorageBlobLogs
+    - SigninLogs
+    - MicrosoftGraphActivityLogs
+    - AzureActivity
+  condition: 3 or more distinct stages observed for the same actor (IP)
+
+platform: sentinel
+rule_type: HuntingQuery
+use_case_id: Cloud-DET-Azure-005_full_killchain_correlation
+schedule: 30m
+lookback: 1d
+suppress: Actor:6h
+
+prerequisites:
+- Storage account diagnostic settings sending StorageBlobLogs to Log Analytics
+- Microsoft Entra ID data connector (SigninLogs)
+- Microsoft Graph Activity Logs data connector (MicrosoftGraphActivityLogs)
+- AzureActivity diagnostic logs, all ingested to the same workspace
+
+watchlists:
+- VPN-Egress-IPs
+- Vuln-Scanner-IPs
+- BAS-IPs
+- Service-Accounts
+- Sanctioned-Apps
+- High-Value-Assets
+
+falsepositives:
+- Same caveats as the individual stage rules (002-004); anonymous storage
+  stages correlate by IP while authenticated stages correlate more
+  reliably by user - if attacker infrastructure differs between recon and
+  login, the IP join may not bridge all stages and analysts should also
+  check stage rules 002-004 individually
+- Internal security assessments/pentests exercising the same attack path intentionally
+
+level: high
+
+kql_query: |
+  let StorageEvents = StorageBlobLogs
+  | where AuthenticationType == "Anonymous"
+  | extend Stage = case(
+      OperationName == "ListBlobs" and Uri has "versions", "2_VersionEnumeration",
+      OperationName == "ListBlobs", "1_ContainerListing",
+      OperationName == "GetBlob" and (Uri has "versionid" or Uri has "versionId"), "3_VersionedBlobDownload", "")
+  | where Stage != ""
+  | project TimeGenerated, Actor = CallerIpAddress, Stage;
+  let SigninEvents = SigninLogs
+  | where AppId == "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
+      and (AuthenticationProtocol == "deviceCode" or AuthenticationRequirement != "")
+  | project TimeGenerated, Actor = IPAddress, Stage = strcat("4_DeviceCodeSignIn_", UserPrincipalName);
+  let GraphEvents = MicrosoftGraphActivityLogs
+  | where RequestUri has "/users" and RequestUri has "$select"
+  | project TimeGenerated, Actor = IPAddress, Stage = "5_BulkUserEnumeration";
+  let AzWhoAmI = AzureActivity
+  | where Authorization has "Az" or OperationNameValue has "SUBSCRIPTIONS/READ"
+  | project TimeGenerated, Actor = CallerIpAddress, Stage = "6_AzIdentityCheck";
+  union StorageEvents, SigninEvents, GraphEvents, AzWhoAmI
+  | summarize Stages = make_set(Stage), StageCount = dcount(Stage),
+              FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated)
+      by Actor
+  | where StageCount >= 3
+  | extend Duration = LastSeen - FirstSeen
+  | order by StageCount desc, LastSeen desc
