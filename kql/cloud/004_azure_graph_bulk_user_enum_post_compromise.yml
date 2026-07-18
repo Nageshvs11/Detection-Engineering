@@ -9,7 +9,7 @@ description: |
   read), correlated by source IP. This combination is characteristic of an
   attacker confirming a newly compromised identity and immediately
   enumerating the tenant's user population.
-author: Detection KB
+author: Nagesh
 date: 2026-07-18
 modified: 2026-07-18
 
