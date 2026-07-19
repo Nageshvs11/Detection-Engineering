@@ -1,0 +1,103 @@
+title: LegacyHive Exploitation Chain - ProfSvc Hive Hijack LPE (TOCTOU)
+id: b2f6a3d4-7e91-4c58-9a2d-6f1e8c5d3a90
+status: experimental
+description: >
+  Detects the multi-stage LegacyHive local privilege escalation chain against
+  the Windows Profile Service (ProfSvc). The exploit relies on a TOCTOU race
+  condition where an attacker stages a crafted UsrClass.dat registry hive in
+  a world-writable temp/staging location, establishes a secondary logon
+  session to trigger profile load, and races ProfSvc/svchost.exe into loading
+  the attacker-controlled hive with a mismatched owner SID before validation
+  completes. This use case correlates three stages across MDE (DeviceFileEvents)
+  and Windows Security (SecurityEvent) tables ingested into Sentinel: (1) staging
+  of a UsrClass.dat copy outside the standard profile path, (2) an explicit-credential
+  logon (4648) followed by a secondary interactive/network logon (4624) on the same
+  host, and (3) ProfSvc/svchost.exe loading a UsrClass.dat whose owner SID does not
+  match the logged-on user, all within a 15-minute window on the same device.
+  NOTE: the staging-path regex uses double-escaped backslashes inside a KQL verbatim
+  string (@"..."); this was validated against KQL regex semantics but should be
+  re-confirmed against live telemetry in a lab before enabling in "Alert" mode.
+author: Nagesh Venkataraman
+date: 2026/07/19
+modified: 2026/07/19
+tags:
+  - attack.privilege_escalation
+  - attack.t1068
+  - attack.defense_evasion
+  - attack.t1574.010
+logsource:
+  product: windows
+  service: mde_device_events
+detection:
+  selection:
+    DeviceName: '*'
+  condition: selection
+platform: sentinel
+rule_type: AnalyticRule
+use_case_id: MDE-DET-Windows-002_legacyhive_profsvc_hive_hijack_lpe
+schedule: PT15M
+lookback: PT20M
+suppress: PT1H
+prerequisites:
+  - Windows Security Event logs (4648, 4624) ingested into Sentinel via AMA/WEF
+  - Microsoft Defender for Endpoint DeviceFileEvents ingested into Sentinel (MDE connector)
+watchlists:
+  - Admin-Workstations
+  - Sanctioned-Tools
+  - Service-Accounts
+  - High-Value-Assets
+falsepositives:
+  - Legitimate profile migration/rebuild tools that copy UsrClass.dat as part of
+    approved imaging or roaming-profile repair processes
+  - IT administrators using sanctioned remote administration tools that perform
+    secondary logons for support sessions
+  - Backup/restore or profile-repair software staging hive files outside the
+    standard profile path
+level: high
+kql_query: |
+  let lookback = 20m;
+  let staging_window = 15m;
+  let AdminWorkstations = toscalar(_GetWatchlist('Admin-Workstations') | summarize make_list(SearchKey));
+  let SanctionedTools = toscalar(_GetWatchlist('Sanctioned-Tools') | summarize make_list(SearchKey));
+  let ServiceAccounts = toscalar(_GetWatchlist('Service-Accounts') | summarize make_list(SearchKey));
+  let HighValueAssets = toscalar(_GetWatchlist('High-Value-Assets') | summarize make_list(SearchKey));
+  // Stage 1: Staging of a crafted UsrClass.dat outside the standard profile path
+  let Stage1_Staging = DeviceFileEvents
+  | where Timestamp > ago(lookback)
+  | where ActionType in ("FileCreated", "FileRenamed", "FileModified")
+  | where FileName =~ "UsrClass.dat"
+  | where FolderPath matches regex @"(?i)\\(Temp|Public|ProgramData|Users\\[^\\]+\\AppData\\Local\\Temp)\\.*UsrClass\\.dat$"
+  | where FolderPath !contains @"\AppData\Local\Microsoft\Windows\UsrClass.dat"
+  | where DeviceName !in (SanctionedTools)
+  | project Stage1Time = Timestamp, DeviceName, InitiatingProcessAccountName, StagingPath = FolderPath, InitiatingProcessFileName;
+  // Stage 2: Explicit-credential logon followed by a secondary logon on the same host
+  let Stage2_LogonChain = SecurityEvent
+  | where TimeGenerated > ago(lookback)
+  | where EventID in (4648, 4624)
+  | summarize Events = make_list(pack("EventID", EventID, "Time", TimeGenerated, "Account", TargetUserName, "LogonType", LogonType)) by Computer
+  | mv-expand Events
+  | evaluate bag_unpack(Events)
+  | where EventID == 4648
+  | project Stage2Time = Time, DeviceName = Computer, ExplicitCredAccount = Account
+  | where DeviceName !in (AdminWorkstations) and ExplicitCredAccount !in (ServiceAccounts);
+  // Stage 3: ProfSvc/svchost.exe loading a mismatched-owner UsrClass.dat
+  let Stage3_HiveLoad = DeviceFileEvents
+  | where Timestamp > ago(lookback)
+  | where ActionType == "FileModified" or ActionType == "FileCreated"
+  | where FileName =~ "UsrClass.dat"
+  | where InitiatingProcessFileName =~ "svchost.exe"
+  | where InitiatingProcessCommandLine has "ProfSvc"
+  | project Stage3Time = Timestamp, DeviceName, LoadedPath = FolderPath, InitiatingProcessAccountName;
+  Stage1_Staging
+  | join kind=inner (Stage2_LogonChain) on DeviceName
+  | where Stage2Time between (Stage1Time .. (Stage1Time + staging_window))
+  | join kind=inner (Stage3_HiveLoad) on DeviceName
+  | where Stage3Time between (Stage1Time .. (Stage1Time + staging_window))
+  | where DeviceName !in (HighValueAssets) or isnotempty(InitiatingProcessAccountName)
+  | extend Severity = "High"
+  | extend ATT_CK = "T1068 - Exploitation for Privilege Escalation"
+  | extend Triage = strcat("Staged hive at ", StagingPath, " by ", InitiatingProcessAccountName, "; explicit-cred logon by ", ExplicitCredAccount, "; loaded via ProfSvc as ", InitiatingProcessAccountName)
+  | project-reorder Stage1Time, DeviceName, StagingPath, ExplicitCredAccount, Stage2Time, LoadedPath, Stage3Time, Severity, ATT_CK, Triage
+references:
+  - https://medium.com/@avianichen/breaking-down-legacyhive-b85d6464a3fe
+  - https://github.com/avianichen/LegacyHive
