@@ -1,0 +1,143 @@
+title: LegacyHive Exploitation Chain - ProfSvc Hive Hijack LPE (TOCTOU, Windows Event Log Only)
+id: 6c9a2f18-4d7b-4e3a-8f01-9b3d7e5c1a44
+status: experimental
+description: |
+  Detects the multi-stage LegacyHive local privilege escalation chain against the Windows
+  Profile Service (ProfSvc) using ONLY native Windows Event Viewer channels forwarded to
+  Splunk (Security, System, Application) — no Sysmon/MDE endpoint file telemetry available.
+  Because file-write visibility is unavailable, Stage 1 pivots to Security 4688 process-creation
+  command-line inspection (staging), Stage 2 remains a Security 4648/4624 explicit-credential +
+  secondary-logon correlation, and Stage 3 uses Application-log User Profile Service diagnostic
+  events (1500/1530/1533) as a best-effort proxy for anomalous hive load activity, since no
+  direct file-load telemetry exists on this log set. An optional System-log 7036 (Service
+  Control Manager) signal for ProfSvc state changes is included as enrichment only.
+author: Nagesh Venkataraman
+date: 2026/07/19
+modified: 2026/07/19
+tags:
+  - attack.privilege_escalation
+  - attack.t1068
+  - attack.defense_evasion
+  - attack.t1574.010
+logsource:
+  product: windows
+  service: security
+detection:
+  selection:
+    EventCode: [4688, 4648, 4624]
+  condition: selection
+platform: splunk
+rule_type: CorrelationSearch
+use_case_id: OS-DET-WIN-005_legacyhive_profsvc_hive_hijack_lpe
+index: "*-os-win"
+sourcetype: "WinEventLog:Security"
+schedule: "*/15 * * * *"
+lookback: 20m
+suppress: Computer:1h
+prerequisites:
+  - "Advanced Audit Policy: Audit Process Creation (Success) enabled, with 'Include command
+    line in process creation events' GPO enabled — required for 4688 command-line visibility"
+  - "Advanced Audit Policy: Audit Logon / Audit Logon (Special) enabled for 4648/4624"
+  - "Application log forwarding must include Microsoft-Windows-User Profile Service
+    diagnostic events (1500/1530/1533) — LAB NOTE: on some OS versions these are logged
+    under Applications and Services Logs > Microsoft-Windows-User Profile Service/Operational
+    rather than the classic Application channel; verify actual channel in your environment
+    before relying on this signal"
+  - "Optional: System log Service Control Manager auditing for 7036 (bonus/enrichment only)"
+lookups:
+  - sanctioned_tools.csv
+  - admin_workstations.csv
+  - service_accounts.csv
+  - high_value_assets.csv
+falsepositives:
+  - IT/administrative scripts that legitimately reference UsrClass.dat in temp/staging
+    paths (profile repair, imaging, roaming-profile tooling) — command-line based
+    matching is noisier than file-write telemetry and prone to this FP class
+  - Backup/restore software invoking cmd/powershell/robocopy against profile hives
+  - Legitimate secondary logons (RDP/support tools) coinciding coincidentally with
+    unrelated profile service diagnostic events within the same 15-minute window
+  - "Detection gap (false negative) risk: non-shell file copy methods (e.g. PowerShell
+    Copy-Item, GUI drag-and-drop, WMI) will not generate a matching 4688 command line"
+level: high
+spl_query: |
+  `comment("Use case ID: OS-DET-WIN-005_legacyhive_profsvc_hive_hijack_lpe")`
+  `comment("ATT&CK: T1068 - Exploitation for Privilege Escalation")`
+  `comment("Assumption: only WinEventLog:Security / System / Application forwarded - no Sysmon/MDE")`
+  (
+    index="*-os-win" sourcetype="WinEventLog:Security" EventCode=4688
+    (New_Process_Name="*\\cmd.exe" OR New_Process_Name="*\\powershell.exe"
+     OR New_Process_Name="*\\xcopy.exe" OR New_Process_Name="*\\robocopy.exe"
+     OR New_Process_Name="*\\reg.exe")
+    Process_Command_Line="*UsrClass.dat*"
+    (Process_Command_Line="*\\Temp\\*" OR Process_Command_Line="*\\Public\\*"
+     OR Process_Command_Line="*\\ProgramData\\*")
+    NOT Process_Command_Line="*\\AppData\\Local\\Microsoft\\Windows\\UsrClass.dat*"
+    NOT [| inputlookup sanctioned_tools.csv | rename process_name AS New_Process_Name | table New_Process_Name]
+    | eval stage="1_staging", dest=Computer, stage_account=Account_Name, stage_detail=Process_Command_Line
+    | table _time, dest, stage, stage_account, stage_detail
+  )
+  | append [
+      search index="*-os-win" sourcetype="WinEventLog:Security" EventCode=4648
+      NOT [| inputlookup service_accounts.csv | rename account_name AS Account_Name | table Account_Name]
+      | eval stage="2_explicit_logon", dest=Computer, stage_account=Account_Name,
+             stage_detail="ExplicitCred:".Target_Server_Name
+      | table _time, dest, stage, stage_account, stage_detail
+    ]
+  | append [
+      search index="*-os-win" sourcetype="WinEventLog:Security" EventCode=4624
+      NOT [| inputlookup admin_workstations.csv | rename hostname AS Computer | table Computer]
+      | eval stage="2_secondary_logon", dest=Computer, stage_account=Account_Name,
+             stage_detail="LogonType:".Logon_Type
+      | table _time, dest, stage, stage_account, stage_detail
+    ]
+  | append [
+      search index="*-os-app" sourcetype="WinEventLog:Application"
+      (EventCode=1500 OR EventCode=1530 OR EventCode=1533)
+      source="Microsoft-Windows-User Profile Service"
+      | eval stage="3_hive_load", dest=Computer, stage_account=coalesce(Account_Name,User),
+             stage_detail="ProfSvcEvent:".EventCode
+      | table _time, dest, stage, stage_account, stage_detail
+    ]
+  | append [
+      search index="*-os-sys" sourcetype="WinEventLog:System" EventCode=7036
+      Message="*Profile Service*"
+      | eval stage="bonus_sys_profsvc_restart", dest=Computer, stage_account="N/A",
+             stage_detail="SCM:7036"
+      | table _time, dest, stage, stage_account, stage_detail
+    ]
+  | lookup high_value_assets.csv hostname AS dest OUTPUT criticality AS asset_criticality
+  | stats earliest(_time) AS first_seen, latest(_time) AS last_seen,
+      dc(stage) AS stage_count, values(stage) AS stages_seen,
+      values(stage_detail) AS details, values(stage_account) AS accounts_seen,
+      latest(asset_criticality) AS asset_criticality
+    by dest
+  | where stage_count >= 3 AND (last_seen - first_seen) <= 900
+  | eval severity=if(asset_criticality="critical","critical","high"),
+      attck_technique="T1068",
+      rule_id="OS-DET-WIN-005_legacyhive_profsvc_hive_hijack_lpe",
+      triage="1. Confirm 4688 staging command line actually copied UsrClass.dat outside the default profile path. 2. Correlate the 4648 explicit-cred account and 4624 secondary logon for anomalous/lateral use. 3. Inspect Application log User Profile Service event detail (1500/1530/1533) on dest for hive-in-use or load errors. 4. Check bonus System log 7036 for ProfSvc restart around the same window. 5. Isolate host; rotate credentials used in the explicit-cred logon."
+  | convert ctime(first_seen) ctime(last_seen)
+  | table severity, dest, accounts_seen, stages_seen, details, first_seen, last_seen, attck_technique, rule_id
+  | sort - severity
+tests:
+  - name: 4688 staging + 4648/4624 logon chain + Application 1530 hive-in-use, same host within 15m (must alert)
+    log_source:
+      product: windows
+      service: security
+    event:
+      EventCode: 4688
+      New_Process_Name: 'C:\\Windows\\System32\\cmd.exe'
+      Process_Command_Line: 'cmd.exe /c copy C:\\Windows\\Temp\\UsrClass.dat C:\\Users\\victim\\AppData\\Local\\Microsoft\\Windows\\UsrClass.dat'
+    expected: match
+  - name: Sanctioned imaging tool copies UsrClass.dat during approved provisioning (must not alert)
+    log_source:
+      product: windows
+      service: security
+    event:
+      EventCode: 4688
+      New_Process_Name: 'C:\\Program Files\\ImagingTool\\imaging.exe'
+    expected: no_match
+references:
+  - https://medium.com/@avianichen/breaking-down-legacyhive-b85d6464a3fe
+  - https://github.com/avianichen/LegacyHive
+  - https://attack.mitre.org/techniques/T1068/
