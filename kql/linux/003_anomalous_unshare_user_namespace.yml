@@ -1,0 +1,99 @@
+title: Anomalous unshare (User-Namespace Creation) by Non-Root (Linux LPE)
+id: 0e33f227-670d-4509-9b81-a7a3b351dc2a
+status: experimental
+description: |
+  Detects 'unshare' creating a user/mount/net namespace by a non-root user, outside
+  sanctioned container and sandbox runtimes. This is the shared precursor across CIFSwitch,
+  OVSwrap, pedit COW and container escapes. Enriched with a namespace-flag decode, an
+  exploit-family ProfileHint (user+net = OVSwrap shape, user+mount = CIFSwitch/overlay
+  shape), sandbox-lineage FP suppression, RiskScore / TriagePriority and DeviceInfo context.
+  Treat as a precursor/triage signal - MDE cannot tie unshare to the subsequent root
+  transition (no uid_change event). Detection logic adapted from Elastic Security Labs.
+author: Nagesh Venkataraman
+date: 2026/09/28
+modified: 2026/09/28
+tags:
+  - attack.privilege_escalation
+  - attack.defense_evasion
+  - attack.t1611
+  - attack.t1068
+logsource:
+  product: linux
+  service: mde_device_events
+detection:
+  selection:
+    DeviceName: '*'
+  condition: selection
+platform: both
+rule_type: AnalyticRule
+use_case_id: OS-DET-LNX-003_anomalous_unshare_user_namespace
+schedule: PT1H
+lookback: PT1H
+suppress: PT1H
+prerequisites:
+  - Linux endpoints onboarded to Microsoft Defender for Endpoint (Plan 2)
+  - MDE DeviceProcessEvents / DeviceInfo available in Defender XDR advanced hunting, or ingested into Sentinel via the Microsoft Defender XDR connector
+watchlists:
+  - Container-Hosts
+  - Sanctioned-Sandbox-Apps
+  - High-Value-Assets
+falsepositives:
+  - Browsers, Electron apps and HPC/sandbox tooling that legitimately create user namespaces (flagged as LikelySandbox) - add to sandboxLineage or a watchlist
+  - Rootless container / CI runners not covered by sanctionedRuntimes - extend the exclusion list
+  - Developer tooling that shells out to unshare for isolation
+level: medium
+kql_query: |
+  let lookback = 1h;
+  // NOTE: namespace-flag regexes are case-sensitive (-U/-r/-m/-n differ from -u/-p);
+  // validate against live command-line formatting before enabling in Alert mode.
+  let writablePaths = dynamic(["/tmp/","/dev/shm/","/var/tmp/","/home/","/run/user/","/var/run/user/","./"]);
+  let sanctionedRuntimes = dynamic(["containerd","containerd-shim","containerd-shim-runc-v2",
+      "dockerd","docker","podman","runc","crun","conmon","systemd-nspawn","bwrap","firejail",
+      "flatpak","snap","snapd"]);
+  let sandboxLineage = dynamic(["chrome","chromium","chrome_crashpad","firefox","firefox-bin",
+      "thunderbird","electron","code","slack","discord","teams","brave","opera","msedge",
+      "nextflow","singularity","apptainer","appimage","gjs"]);
+  DeviceProcessEvents
+  | where Timestamp > ago(lookback)
+  | where FileName == "unshare"
+  | where AccountName != "root"
+  | where InitiatingProcessFileName !in~ (sanctionedRuntimes)
+  | extend NsUser  = iif(ProcessCommandLine has "--user" or ProcessCommandLine matches regex @"(^|\s)-\w*U", true, false)
+  | extend MapsRoot= iif(ProcessCommandLine has "--map-root-user" or ProcessCommandLine matches regex @"(^|\s)-\w*r", true, false)
+  | extend NsMount = iif(ProcessCommandLine has "--mount" or ProcessCommandLine matches regex @"(^|\s)-\w*m", true, false)
+  | extend NsNet   = iif(ProcessCommandLine has "--net" or ProcessCommandLine matches regex @"(^|\s)-\w*n", true, false)
+  | where NsUser or MapsRoot or NsMount or NsNet
+  | extend ProfileHint = case(
+      NsUser and NsNet and not(NsMount), "OVSwrap-style: user+net ns (namespace-local CAP_NET_ADMIN)",
+      NsUser and NsMount,                "CIFSwitch/overlay-style: user+mount ns (hostile mount)",
+      NsUser and not(NsNet or NsMount),  "User-namespace capability grant",
+      "unshare (other namespace flags)")
+  | extend ParentIsInterpreter = iif(InitiatingProcessFileName has_any ("python","perl","ruby","php","lua","node","deno","bun"), true, false)
+  | extend ParentFromWritable  = iif(InitiatingProcessFolderPath has_any (writablePaths), true, false)
+  | extend LikelySandbox       = iif(InitiatingProcessFileName has_any (sandboxLineage), true, false)
+  | extend MultiNamespace      = iif(toint(NsUser)+toint(NsMount)+toint(NsNet) >= 2, true, false)
+  | extend RiskScore = toint(ParentFromWritable)+toint(ParentIsInterpreter)+toint(MapsRoot)+toint(MultiNamespace)
+  | extend TriagePriority = case(
+      LikelySandbox,  "Low (likely sandbox)",
+      RiskScore >= 3, "High",
+      RiskScore == 2, "Medium",
+      "Low")
+  | join kind=leftouter (
+      DeviceInfo
+      | where Timestamp > ago(lookback)
+      | summarize arg_max(Timestamp, OSPlatform, OSVersion, DeviceType, MachineGroup, LoggedOnUsers) by DeviceId
+      | project DeviceId, OSPlatform, OSVersion, DeviceType, MachineGroup, LoggedOnUsers
+    ) on DeviceId
+  | project Timestamp, TriagePriority, RiskScore, ProfileHint,
+            DeviceName, MachineGroup, OSPlatform, OSVersion, DeviceType,
+            AccountName, ProcessCommandLine,
+            NsUser, MapsRoot, NsMount, NsNet, MultiNamespace,
+            InitiatingProcessAccountName, InitiatingProcessFileName, InitiatingProcessFolderPath,
+            ParentIsInterpreter, ParentFromWritable, LikelySandbox,
+            InitiatingProcessParentFileName, InitiatingProcessSHA256, InitiatingProcessId,
+            LoggedOnUsers, DeviceId, ReportId
+  | sort by RiskScore desc, Timestamp desc
+references:
+  - https://www.elastic.co/security-labs/threat-command/linux-privilege-escalation-detection-framework
+  - https://github.com/elastic/detection-rules
+  - https://github.com/elastic/protections-artifacts

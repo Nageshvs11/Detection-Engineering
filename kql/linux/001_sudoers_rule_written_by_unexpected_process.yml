@@ -1,0 +1,82 @@
+title: Sudoers Rule Written by Unexpected Process (Linux LPE)
+id: 79de9816-22ac-4018-a278-e4dc543a6f31
+status: experimental
+description: |
+  Detects creation or modification of files under /etc/sudoers or /etc/sudoers.d/ by a
+  process outside sanctioned package- and configuration-management tooling. Writing a
+  passwordless sudo rule is the finishing move in CIFSwitch (CVE-2026-46243) and OVSwrap
+  (CVE-2026-64531) and a common root-persistence step generally. Enriched with writer
+  context (non-root, writable-path, shell one-liner, NOPASSWD) and a heuristic RiskScore /
+  TriagePriority, plus DeviceInfo host context (MachineGroup, OS, logged-on users).
+  Detection logic adapted from Elastic Security Labs - Linux LPE detection framework.
+author: Nagesh Venkataraman
+date: 2026/09/28
+modified: 2026/09/28
+tags:
+  - attack.privilege_escalation
+  - attack.t1548.003
+logsource:
+  product: linux
+  service: mde_device_events
+detection:
+  selection:
+    DeviceName: '*'
+  condition: selection
+platform: both
+rule_type: AnalyticRule
+use_case_id: OS-DET-LNX-001_sudoers_rule_written_by_unexpected_process
+schedule: PT1H
+lookback: PT1H
+suppress: PT1H
+prerequisites:
+  - Linux endpoints onboarded to Microsoft Defender for Endpoint (Plan 2)
+  - MDE DeviceFileEvents / DeviceInfo available in Defender XDR advanced hunting, or ingested into Sentinel via the Microsoft Defender XDR connector
+watchlists:
+  - Sanctioned-Config-Mgmt
+  - High-Value-Assets
+falsepositives:
+  - Approved package managers or config-management agents not covered by the exclusion list - extend sanctionedWriters
+  - Local admins hand-editing sudoers via a non-visudo path (e.g. sudoedit wrapper) - baseline per host group
+  - Backup/restore tooling that recreates /etc/sudoers.d entries
+level: high
+kql_query: |
+  let lookback = 1h;
+  // Exclusions are inline dynamic() lists; optionally swap for _GetWatchlist('Sanctioned-Config-Mgmt').
+  let writablePaths = dynamic(["/tmp/","/dev/shm/","/var/tmp/","/home/","/run/user/","/var/run/user/","./"]);
+  let sanctionedWriters = dynamic(["apt","apt-get","dpkg","yum","dnf","rpm","zypper",
+      "ansible","ansible-playbook","puppet","chef-client","salt-minion","cloud-init","visudo"]);
+  DeviceFileEvents
+  | where Timestamp > ago(lookback)
+  | where FolderPath startswith "/etc/sudoers.d/" or FolderPath == "/etc/sudoers"
+  | where ActionType in ("FileCreated","FileModified","FileRenamed")
+  | where InitiatingProcessFileName !in~ (sanctionedWriters)
+  | extend WriterIsNonRoot        = iif(InitiatingProcessAccountName != "root", true, false)
+  | extend WriterFromWritablePath = iif(InitiatingProcessFolderPath has_any (writablePaths), true, false)
+  | extend IsNewDropIn            = iif(ActionType == "FileCreated" and FolderPath startswith "/etc/sudoers.d/", true, false)
+  | extend WriteViaShellOneLiner  = iif(InitiatingProcessFileName in~ ("bash","sh","dash","zsh","ksh","tee")
+                                        and (InitiatingProcessCommandLine contains ">>"
+                                             or InitiatingProcessCommandLine contains "tee"), true, false)
+  | extend MentionsNopasswd       = iif(InitiatingProcessCommandLine contains "NOPASSWD", true, false)
+  | extend RiskScore = iif(WriterIsNonRoot,1,0) + iif(WriterFromWritablePath,1,0)
+                     + iif(IsNewDropIn,1,0) + iif(WriteViaShellOneLiner,1,0) + iif(MentionsNopasswd,1,0)
+  | extend TriagePriority = case(RiskScore >= 3, "High", RiskScore == 2, "Medium", "Low")
+  | join kind=leftouter (
+      DeviceInfo
+      | where Timestamp > ago(lookback)
+      | summarize arg_max(Timestamp, OSPlatform, OSVersion, DeviceType, MachineGroup, LoggedOnUsers) by DeviceId
+      | project DeviceId, OSPlatform, OSVersion, DeviceType, MachineGroup, LoggedOnUsers
+    ) on DeviceId
+  | project Timestamp, TriagePriority, RiskScore,
+            DeviceName, MachineGroup, OSPlatform, OSVersion, DeviceType,
+            FolderPath, FileName, ActionType, PreviousFileName,
+            InitiatingProcessAccountName, WriterIsNonRoot,
+            InitiatingProcessFileName, InitiatingProcessCommandLine, InitiatingProcessFolderPath, WriterFromWritablePath,
+            InitiatingProcessParentFileName,
+            IsNewDropIn, WriteViaShellOneLiner, MentionsNopasswd,
+            InitiatingProcessSHA256, InitiatingProcessId, InitiatingProcessCreationTime,
+            LoggedOnUsers, DeviceId, ReportId
+  | sort by RiskScore desc, Timestamp desc
+references:
+  - https://www.elastic.co/security-labs/threat-command/linux-privilege-escalation-detection-framework
+  - https://github.com/elastic/detection-rules
+  - https://github.com/elastic/protections-artifacts

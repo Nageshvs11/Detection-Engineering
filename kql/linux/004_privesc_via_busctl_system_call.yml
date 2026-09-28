@@ -1,0 +1,99 @@
+title: Privilege Escalation via busctl System Call (Linux LPE)
+id: f2b76a88-ec26-42da-b3da-2fda1d962f30
+status: experimental
+description: |
+  Detects a non-root user invoking 'busctl call' against the system bus - the core of the
+  ptrace_may_dream / AccountsService abuse path (CVE-2026-46333 class). Enriched by decoding
+  the D-Bus call target (service/member), a CallCategory verdict (AccountsService account
+  modification, systemd run-as-root, polkit, PackageKit, generic mutating call), a burst
+  counter that surfaces the pidfd_getfd race loop, RiskScore / TriagePriority and DeviceInfo
+  context. NOTE: the FD-theft primitive itself is invisible to MDE; this detects the busctl
+  trigger and account-modification aftermath. Detection logic adapted from Elastic Security Labs.
+author: Nagesh Venkataraman
+date: 2026/09/28
+modified: 2026/09/28
+tags:
+  - attack.privilege_escalation
+  - attack.t1548
+logsource:
+  product: linux
+  service: mde_device_events
+detection:
+  selection:
+    DeviceName: '*'
+  condition: selection
+platform: both
+rule_type: AnalyticRule
+use_case_id: OS-DET-LNX-004_privesc_via_busctl_system_call
+schedule: PT1H
+lookback: PT1H
+suppress: PT1H
+prerequisites:
+  - Linux endpoints onboarded to Microsoft Defender for Endpoint (Plan 2)
+  - MDE DeviceProcessEvents / DeviceInfo available in Defender XDR advanced hunting, or ingested into Sentinel via the Microsoft Defender XDR connector
+watchlists:
+  - High-Value-Assets
+falsepositives:
+  - Management/monitoring agents that legitimately call system services over D-Bus - baseline the initiating binary/account
+  - Admin scripts using busctl for hostname/timedate/systemd changes (flagged mutating, but may be sanctioned)
+level: high
+kql_query: |
+  let lookback = 1h;
+  // NOTE: the two extract() regexes parse the D-Bus call target positionally; validate
+  // DbusService/DbusMember against live command-line quoting/ordering before relying on them.
+  let writablePaths = dynamic(["/tmp/","/dev/shm/","/var/tmp/","/home/","/run/user/","/var/run/user/","./"]);
+  let acctMethods = dynamic(["SetShell","SetPassword","SetAccountType","SetUserName","SetHomeDirectory",
+      "SetLocked","SetPasswordMode","SetAutomaticLogin","CreateUser","DeleteUser"]);
+  DeviceProcessEvents
+  | where Timestamp > ago(lookback)
+  | where FileName == "busctl"
+  | where ProcessCommandLine has "call"
+  | where ProcessCommandLine has_any ("--system","org.freedesktop","AccountsService")
+  | where AccountName != "root"
+  | extend DbusService = extract(@"\bcall\b\s+(?:--\S+\s+|-\w+\s+)*([A-Za-z0-9][\w.\-]+)", 1, ProcessCommandLine)
+  | extend DbusMember  = extract(@"\bcall\b\s+(?:--\S+\s+|-\w+\s+)*[A-Za-z0-9][\w.\-]+\s+\S+\s+[\w.\-]+\s+(\w+)", 1, ProcessCommandLine)
+  | extend SystemBus   = iif(ProcessCommandLine has "--user", false, true)
+  | extend IsMutating  = iif(ProcessCommandLine matches regex @"\b(Set|Create|Delete|Start|Add|Enable|Install|Update|Remove|Modify|Kill)\w+", true, false)
+  | extend CallCategory = case(
+      DbusService has "Accounts" and ProcessCommandLine has_any (acctMethods),
+          "AccountsService account modification (ptrace_may_dream / CVE-2026-46333 class)",
+      DbusService has "systemd1" and ProcessCommandLine has_any ("StartTransientUnit","StartUnit","EnableUnitFiles"),
+          "systemd unit start via D-Bus (run-as-root primitive)",
+      DbusService has "PolicyKit1",           "polkit authorization interaction",
+      DbusService has "PackageKit",           "PackageKit privileged install",
+      DbusService has_any ("hostname1","locale1","timedate1","login1","NetworkManager") and IsMutating,
+          "Privileged systemd/NM service mutation",
+      IsMutating,                             "Privileged D-Bus mutating call",
+      "D-Bus call (introspection / read)")
+  | extend ParentIsInterpreter = iif(InitiatingProcessFileName has_any ("python","perl","ruby","php","lua","node","deno","bun"), true, false)
+  | extend ParentFromWritable  = iif(InitiatingProcessFolderPath has_any (writablePaths), true, false)
+  | extend TimeBin = bin(Timestamp, 5m)
+  | join kind=leftouter (
+      DeviceProcessEvents
+      | where Timestamp > ago(lookback)
+      | where FileName == "busctl" and ProcessCommandLine has "call" and AccountName != "root"
+      | summarize BurstCount = count() by DeviceId, TimeBin = bin(Timestamp, 5m)
+    ) on DeviceId, TimeBin
+  | extend RiskScore = toint(SystemBus and IsMutating) + toint(ParentFromWritable) + toint(ParentIsInterpreter)
+                     + toint(CallCategory startswith "AccountsService" or CallCategory startswith "systemd")
+                     + toint(BurstCount >= 5)
+  | extend TriagePriority = case(RiskScore >= 3, "High", RiskScore == 2, "Medium", "Low")
+  | join kind=leftouter (
+      DeviceInfo
+      | where Timestamp > ago(lookback)
+      | summarize arg_max(Timestamp, OSPlatform, OSVersion, DeviceType, MachineGroup, LoggedOnUsers) by DeviceId
+      | project DeviceId, OSPlatform, OSVersion, DeviceType, MachineGroup, LoggedOnUsers
+    ) on DeviceId
+  | project Timestamp, TriagePriority, RiskScore, CallCategory,
+            DbusService, DbusMember, SystemBus, IsMutating, BurstCount,
+            DeviceName, MachineGroup, OSPlatform, OSVersion, DeviceType,
+            AccountName, ProcessCommandLine,
+            InitiatingProcessAccountName, InitiatingProcessFileName, InitiatingProcessFolderPath,
+            ParentIsInterpreter, ParentFromWritable, InitiatingProcessParentFileName,
+            InitiatingProcessSHA256, InitiatingProcessId,
+            LoggedOnUsers, DeviceId, ReportId
+  | sort by RiskScore desc, Timestamp desc
+references:
+  - https://www.elastic.co/security-labs/threat-command/linux-privilege-escalation-detection-framework
+  - https://github.com/elastic/detection-rules
+  - https://github.com/elastic/protections-artifacts

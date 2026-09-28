@@ -1,0 +1,52 @@
+title: Privileged-Mode Shell (-p) from Non-Standard Path (Linux LPE)
+id: c59f6ac0-af91-4d63-b3b2-42ae46af2eab
+status: experimental
+description: |
+  Detects a shell launched with the privilege-preserving -p flag from a location outside the
+  standard binary directories - the execution step that converts a SUID-root shell copy into
+  an interactive root shell. Pairs directly with OS-DET-LNX-005 (see correlation
+  OS-DET-LNX-007). Detection logic adapted from Elastic Security Labs.
+author: Nagesh Venkataraman
+date: 2026/09/28
+modified: 2026/09/28
+tags:
+  - attack.privilege_escalation
+  - attack.t1548.001
+logsource:
+  product: linux
+  service: mde_device_events
+detection:
+  selection:
+    DeviceName: '*'
+  condition: selection
+platform: both
+rule_type: AnalyticRule
+use_case_id: OS-DET-LNX-006_privileged_mode_shell_from_nonstandard_path
+schedule: PT1H
+lookback: PT1H
+suppress: PT1H
+prerequisites:
+  - Linux endpoints onboarded to Microsoft Defender for Endpoint (Plan 2)
+  - MDE DeviceProcessEvents / DeviceInfo available in Defender XDR advanced hunting, or ingested into Sentinel via the Microsoft Defender XDR connector
+watchlists:
+  - High-Value-Assets
+falsepositives:
+  - Interactive shells legitimately launched with -p from an app-bundled path - baseline per host group
+  - The -p regex is broad; confirm it is not matching an unrelated -p option on your shell builds
+level: high
+kql_query: |
+  let lookback = 1h;
+  DeviceProcessEvents
+  | where Timestamp > ago(lookback)
+  | where FileName in ("bash","sh","dash","zsh","ksh","tcsh","csh","mksh","busybox")
+  | where ProcessCommandLine matches regex @"\s-\w*p\w*(\s|$)"
+  | where FolderPath !startswith "/bin/" and FolderPath !startswith "/usr/bin/"
+      and FolderPath !startswith "/usr/local/bin/" and FolderPath !startswith "/sbin/"
+  | project Timestamp, DeviceName, DeviceId, AccountName, FileName, FolderPath,
+            ProcessCommandLine, InitiatingProcessAccountName,
+            InitiatingProcessCommandLine, InitiatingProcessFolderPath, ReportId
+  | sort by Timestamp desc
+references:
+  - https://www.elastic.co/security-labs/threat-command/linux-privilege-escalation-detection-framework
+  - https://github.com/elastic/detection-rules
+  - https://github.com/elastic/protections-artifacts

@@ -1,0 +1,91 @@
+title: System Shell/Binary Copied to Non-Standard Path (Linux LPE)
+id: 2ac29c69-225d-4ab7-a38b-6dd625b15b66
+status: experimental
+description: |
+  Detects a system shell/interpreter copied or moved into a writable or non-standard path -
+  the precursor to the 'copy /bin/bash, set SUID, run bash -p' misconfiguration abuse and a
+  common staging step in the page-cache PoCs. Enriched with source/destination decode, an
+  inline-SUID-intent flag (chmod +s / chmod 4755 / install -m / setcap in the same command),
+  masquerade flags (renamed, hidden dotfile, system-lookalike name), a weighted RiskScore /
+  TriagePriority and DeviceInfo context. Pairs with OS-DET-LNX-006 and correlation
+  OS-DET-LNX-007. Detection logic adapted from Elastic Security Labs.
+author: Nagesh Venkataraman
+date: 2026/09/28
+modified: 2026/09/28
+tags:
+  - attack.defense_evasion
+  - attack.privilege_escalation
+  - attack.t1036
+  - attack.t1548.001
+logsource:
+  product: linux
+  service: mde_device_events
+detection:
+  selection:
+    DeviceName: '*'
+  condition: selection
+platform: both
+rule_type: AnalyticRule
+use_case_id: OS-DET-LNX-005_system_shell_copied_to_nonstandard_path
+schedule: PT1H
+lookback: PT1H
+suppress: PT1H
+prerequisites:
+  - Linux endpoints onboarded to Microsoft Defender for Endpoint (Plan 2)
+  - MDE DeviceProcessEvents / DeviceInfo available in Defender XDR advanced hunting, or ingested into Sentinel via the Microsoft Defender XDR connector
+watchlists:
+  - Admin-Backup-Tools
+  - High-Value-Assets
+falsepositives:
+  - Admin backups of a shell (cp /bin/bash ~/bash.bak) - low RiskScore, non-SUID; float to bottom
+  - Imaging/provisioning tooling copying shells - baseline the initiating process
+  - Best-effort dest parsing may misread unusual quoting; validate before trusting masquerade flags
+level: medium
+kql_query: |
+  let lookback = 1h;
+  // NOTE: DestPath/DestBasename use best-effort positional parsing of cp/mv/dd(of=)/install
+  // arguments; validate against live command lines before trusting RenamedShell/SystemLookalike.
+  let writablePaths = dynamic(["/tmp/","/dev/shm/","/var/tmp/","/home/","/run/user/","/var/run/user/","./"]);
+  let shellNames = dynamic(["bash","sh","dash","zsh","ksh"]);
+  let sysLookalikes = dynamic(["systemd","kworker","kthreadd","crond","dbus","init","ksoftirqd","migration","rcu_"]);
+  DeviceProcessEvents
+  | where Timestamp > ago(lookback)
+  | where FileName in ("cp","mv","install","dd","busybox")
+  | where ProcessCommandLine has_any ("/bin/bash","/usr/bin/bash","/bin/sh","/usr/bin/sh",
+      "/bin/dash","/bin/zsh","/usr/bin/zsh","/bin/ksh")
+  | where ProcessCommandLine has_any ("/tmp/","/dev/shm/","/var/tmp/","/home/","/run/user/","./")
+  | extend SrcShell    = extract(@"(/(?:usr/)?bin/(?:bash|sh|dash|zsh|ksh))", 1, ProcessCommandLine)
+  | extend DestPath    = extract(@"(?:of=)?((?:/tmp/|/dev/shm/|/var/tmp/|/home/|/run/user/|/var/run/user/|\./)[^\s'""]+)", 1, ProcessCommandLine)
+  | extend DestBasename= tostring(split(DestPath, "/")[-1])
+  | extend SuidSetInline = iif(ProcessCommandLine matches regex @"(chmod|install)\s[^&;|]*(?:\+s|0?[2367][0-7]{3})"
+                              or ProcessCommandLine has "setcap", true, false)
+  | extend RenamedShell   = iif(isnotempty(DestBasename) and DestBasename !in (shellNames), true, false)
+  | extend HiddenDest     = iif(DestBasename startswith ".", true, false)
+  | extend SystemLookalike= iif(DestBasename has_any (sysLookalikes) or DestBasename startswith "[", true, false)
+  | extend ParentIsInterpreter = iif(InitiatingProcessFileName has_any ("python","perl","ruby","php","lua","node","deno","bun"), true, false)
+  | extend ParentFromWritable  = iif(InitiatingProcessFolderPath has_any (writablePaths), true, false)
+  | extend UnusualCopyTool     = iif(FileName in ("dd","install"), true, false)
+  | extend NonRootActor        = iif(AccountName != "root", true, false)
+  | extend RiskScore = toint(SuidSetInline)*2 + toint(RenamedShell or HiddenDest or SystemLookalike)
+                     + toint(ParentFromWritable) + toint(ParentIsInterpreter) + toint(UnusualCopyTool)
+  | extend TriagePriority = case(SuidSetInline, "High (SUID intent)", RiskScore >= 3, "High", RiskScore == 2, "Medium", "Low")
+  | join kind=leftouter (
+      DeviceInfo
+      | where Timestamp > ago(lookback)
+      | summarize arg_max(Timestamp, OSPlatform, OSVersion, DeviceType, MachineGroup, LoggedOnUsers) by DeviceId
+      | project DeviceId, OSPlatform, OSVersion, DeviceType, MachineGroup, LoggedOnUsers
+    ) on DeviceId
+  | project Timestamp, TriagePriority, RiskScore,
+            DeviceName, MachineGroup, OSPlatform, OSVersion, DeviceType,
+            AccountName, NonRootActor, FileName, ProcessCommandLine,
+            SrcShell, DestPath, DestBasename,
+            SuidSetInline, RenamedShell, HiddenDest, SystemLookalike, UnusualCopyTool,
+            InitiatingProcessAccountName, InitiatingProcessFileName, InitiatingProcessFolderPath,
+            ParentIsInterpreter, ParentFromWritable, InitiatingProcessParentFileName,
+            InitiatingProcessSHA256, InitiatingProcessId,
+            LoggedOnUsers, DeviceId, ReportId
+  | sort by RiskScore desc, Timestamp desc
+references:
+  - https://www.elastic.co/security-labs/threat-command/linux-privilege-escalation-detection-framework
+  - https://github.com/elastic/detection-rules
+  - https://github.com/elastic/protections-artifacts

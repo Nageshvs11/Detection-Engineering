@@ -1,0 +1,69 @@
+title: Correlated Shell Copy Followed by Privileged-Mode Execution (Linux LPE)
+id: 6d17cffd-9666-4615-9e6f-4e6cc9d350da
+status: experimental
+description: |
+  High-fidelity correlation of OS-DET-LNX-005 and OS-DET-LNX-006: a system shell copied to a
+  non-standard/writable path, followed within 15 minutes on the same host by execution of a
+  shell with the privilege-preserving -p flag from a non-standard path. The two events
+  together are a near-certain SUID-root shell misconfiguration abuse (bash -p to root) and a
+  lower-FP signal than either component alone. Detection logic adapted from Elastic Security Labs.
+author: Nagesh Venkataraman
+date: 2026/09/28
+modified: 2026/09/28
+tags:
+  - attack.privilege_escalation
+  - attack.defense_evasion
+  - attack.t1548.001
+  - attack.t1036
+logsource:
+  product: linux
+  service: mde_device_events
+detection:
+  selection:
+    DeviceName: '*'
+  condition: selection
+platform: both
+rule_type: AnalyticRule
+use_case_id: OS-DET-LNX-007_correlated_shell_copy_then_privileged_exec
+schedule: PT1H
+lookback: PT1H
+suppress: PT1H
+prerequisites:
+  - Linux endpoints onboarded to Microsoft Defender for Endpoint (Plan 2)
+  - MDE DeviceProcessEvents / DeviceInfo available in Defender XDR advanced hunting, or ingested into Sentinel via the Microsoft Defender XDR connector
+watchlists:
+  - High-Value-Assets
+falsepositives:
+  - Rare benign sequence where a shell is copied and a -p shell is run from the same non-standard path within 15 min - inspect DestBasename linkage
+  - Provisioning workflows that stage and then run shells; baseline per host group
+level: high
+kql_query: |
+  let window = 1h;
+  let maxspan = 15m;
+  let shellCopies =
+      DeviceProcessEvents
+      | where Timestamp > ago(window)
+      | where FileName in ("cp","mv","install","dd","busybox")
+      | where ProcessCommandLine has_any ("/bin/bash","/usr/bin/bash","/bin/sh","/usr/bin/sh",
+          "/bin/dash","/bin/zsh","/usr/bin/zsh","/bin/ksh")
+      | where ProcessCommandLine has_any ("/tmp/","/dev/shm/","/var/tmp/","/home/","/run/user/","./")
+      | project CopyTime = Timestamp, DeviceId, CopyAccount = AccountName, CopyCommandLine = ProcessCommandLine;
+  let privShells =
+      DeviceProcessEvents
+      | where Timestamp > ago(window)
+      | where FileName in ("bash","sh","dash","zsh","ksh","tcsh","csh","mksh","busybox")
+      | where ProcessCommandLine matches regex @"\s-\w*p\w*(\s|$)"
+      | where FolderPath !startswith "/bin/" and FolderPath !startswith "/usr/bin/"
+          and FolderPath !startswith "/usr/local/bin/" and FolderPath !startswith "/sbin/"
+      | project ExecTime = Timestamp, DeviceId, DeviceName, ExecAccount = AccountName,
+                ShellPath = FolderPath, ExecCommandLine = ProcessCommandLine, ReportId;
+  privShells
+  | join kind=inner shellCopies on DeviceId
+  | where ExecTime between (CopyTime .. (CopyTime + maxspan))
+  | project Timestamp = ExecTime, DeviceName, DeviceId, ExecAccount, ShellPath,
+            ExecCommandLine, CopyTime, CopyAccount, CopyCommandLine, ReportId
+  | sort by Timestamp desc
+references:
+  - https://www.elastic.co/security-labs/threat-command/linux-privilege-escalation-detection-framework
+  - https://github.com/elastic/detection-rules
+  - https://github.com/elastic/protections-artifacts
